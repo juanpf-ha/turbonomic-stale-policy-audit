@@ -9,7 +9,7 @@ import urllib3
 import argparse
 import shutil
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -86,7 +86,7 @@ def classify_vmware_policy(name, enabled, entity_type, reasons_str, scope_count,
     return "REVIEW", "Review manually - may still be relevant for VMware environment"
 
 def analyze_vmware_targets(session):
-    print("\n── VMware vCenter Targets ───────────────────────────")
+    print("\n-- VMware vCenter Targets ---------------------------")
     try:
         r = session.get(f"{TURBO_HOST}/api/v3/targets")
         if r.status_code == 200:
@@ -112,7 +112,7 @@ def analyze_vmware_targets(session):
         return [], []
 
 def get_vmware_entity_counts(session):
-    print("\n── VMware Entity Inventory ──────────────────────────")
+    print("\n-- VMware Entity Inventory --------------------------")
     entity_counts = {}
     for entity_type in VMWARE_ENTITY_TYPES:
         try:
@@ -149,7 +149,7 @@ def generate_excel_report(results, vmware_targets, disconnected_targets, entity_
     summary_data = [
         ["Turbonomic Stale Policy Audit - VMware On-Premises"], [],
         ["Host", TURBO_HOST],
-        ["Analysis Date", datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")],
+        ["Analysis Date", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")],
         ["Inactivity Threshold", f"{INACTIVITY_DAYS} days"], [],
         ["VMware Environment"], [],
         ["Total vCenter Targets", len(vmware_targets)],
@@ -264,10 +264,10 @@ def main():
     vmware_targets, disconnected_targets = analyze_vmware_targets(session)
     entity_counts = get_vmware_entity_counts(session)
 
-    cutoff_date = datetime.utcnow() - timedelta(days=INACTIVITY_DAYS)
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=INACTIVITY_DAYS)
     cutoff_ms = int(cutoff_date.timestamp() * 1000)
 
-    print(f"\n── Audit Log (last {INACTIVITY_DAYS} days) ──────────────────────────")
+    print(f"\n-- Audit Log (last {INACTIVITY_DAYS} days) --------------------------")
     policy_ids_in_audit = set()
     audit_count = 0
     try:
@@ -298,7 +298,7 @@ def main():
 
     results = []
 
-    print(f"\n── Automation Policies ──────────────────────────────")
+    print(f"\n-- Automation Policies ------------------------------")
     r = session.get(f"{TURBO_HOST}/api/v3/policies")
     if r.status_code == 200:
         policies = r.json()
@@ -337,7 +337,7 @@ def main():
                     "entityType": etype, "enabled": str(enabled), "scope_count": scope_count,
                     "in_audit": str(in_audit), "last_modified": last_mod or "N/A", "reasons": rs})
 
-    print(f"\n── Settings Policies ────────────────────────────────")
+    print(f"\n-- Settings Policies --------------------------------")
     r2 = session.get(f"{TURBO_HOST}/api/v3/settingspolicies")
     if r2.status_code == 200:
         spolicies = r2.json()
@@ -381,7 +381,7 @@ def main():
     print(f"{'=' * 70}")
     print(f"  Host: {TURBO_HOST}")
     print(f"  Inactivity threshold: {INACTIVITY_DAYS} days")
-    print(f"  Analysis date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  Analysis date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'=' * 70}")
     print(f"  VMware targets    : {len(vmware_targets)} ({len(disconnected_targets)} disconnected)")
     print(f"  VMware entities   : {sum(entity_counts.values())}")
