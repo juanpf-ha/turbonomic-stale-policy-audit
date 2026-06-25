@@ -7,7 +7,10 @@ Optimized for environments monitoring VMware workloads in on-premises datacenter
 import requests
 import urllib3
 import argparse
+import shutil
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -396,10 +399,29 @@ def main():
     print(f"Report exported: ~/turbo-audit/{OUTPUT_FILE}")
     print("Sheets: 'Summary' | 'DELETE' | 'REVIEW' | 'All Policies' | 'VMware Environment'")
 
+def get_downloads_folder():
+    """Detecta la carpeta de descargas independientemente del idioma del sistema"""
+    home = Path.home()
+    
+    # Intentar carpetas comunes en diferentes idiomas
+    possible_folders = [
+        home / "Downloads",      # Inglés, Alemán
+        home / "Descargas",      # Español
+        home / "Téléchargements", # Francés
+        home / "Scaricati",      # Italiano
+        home / "Transferências", # Portugués
+    ]
+    
+    for folder in possible_folders:
+        if folder.exists():
+            return folder
+    
+    # Si no encuentra ninguna, usar el home
+    return home
+
 if __name__ == "__main__":
     main()
-
-import shutil, os
-_dest = os.path.expanduser(f"~/Downloads/{OUTPUT_FILE}")
-shutil.copy2(OUTPUT_FILE, _dest)
-print(f"Copied to Downloads: {_dest}")
+    
+    _dest = get_downloads_folder() / OUTPUT_FILE
+    shutil.copy2(OUTPUT_FILE, _dest)
+    print(f"Copied to: {_dest}")
