@@ -1,149 +1,440 @@
 # Turbonomic Stale Policy Audit
 
-A non-invasive Python script that connects to the Turbonomic REST API to identify unused, orphaned, or obsolete policies across any environment — VMware on-premises, Azure, AWS, GCP, or hybrid.
+Non-invasive Python script to audit Turbonomic policies and identify candidates for cleanup, review, or retention.
+
+The script connects to the Turbonomic REST API, reads policy metadata, target status, action history, audit information when available, and inventory counts. It generates an Excel workbook with a summary and detailed policy classification.
+
+The script does **not** modify Turbonomic. It does not create, update, delete, or execute any action.
 
 ---
 
-## What It Does
+## Purpose
 
-The script queries the following Turbonomic API endpoints:
+This tool helps identify stale, disabled, unused, empty-scope, or potentially obsolete Turbonomic policies.
 
-- `/api/v3/policies` — automation policies (resize, move, suspend actions)
-- `/api/v3/settingspolicies` — settings policies (entity configuration, cloud tier exclusions)
-- `/api/v3/actions` — recent actions generated per policy
-- `/api/v3/audit` — audit log of platform activity
-- `/api/v3/targets` — connected targets (vCenter, Azure, AWS, GCP)
-- `/api/v3/search` — entity inventory counts
+Typical use cases:
 
-Each policy is classified into one of three categories:
+* Review old or unused automation policies.
+* Detect disabled policies that may no longer be needed.
+* Identify policies with empty scope.
+* Identify policies without recent activity.
+* Review VMware-focused policy configuration in on-premises environments.
+* Export policy findings to Excel for manual validation.
 
-| Classification | Meaning |
-|---|---|
-| **DELETE** | Safe to remove — disabled test policies, orphaned Azure/GCP resources, auto-generated policies from disconnected targets |
-| **REVIEW** | Requires manual verification — empty scope, no recent actions, absent from audit log |
-| **KEEP** | Retain — Turbonomic built-in defaults |
+---
 
-Output is an Excel workbook with four sheets: **Summary**, **DELETE**, **REVIEW**, and **All Policies**.
+## Tested Scenario
+
+This version was tested against an on-premises Turbonomic instance with a VMware vCenter target.
+
+Example successful run:
+
+```text
+Authentication successful
+
+-- VMware vCenter Targets ---------------------------
+  Total VMware targets: 1
+  WARNING: plvcenter02.example.local: Discovered
+
+-- VMware Entity Inventory --------------------------
+  Total VMware entities: 4
+
+-- Audit Log (last 90 days) -------------------------
+  Audit log unavailable: 404
+  Audit entries retrieved: 0
+  Policies with activity: 0
+
+-- Automation Policies ------------------------------
+  Total policies: 137
+  VMware-specific: 0
+  Other entity types: 137
+
+-- Settings Policies --------------------------------
+  Total settings policies: 78
+  VMware-specific: 47
+
+AUDIT SUMMARY
+  TOTAL flagged     : 215
+    VMware-specific : 47
+    Other types     : 168
+
+  DELETE (safe)     : 27
+  REVIEW            : 161
+  KEEP              : 27
+```
+
+---
+
+## Required Turbonomic Role
+
+The minimum tested role is:
+
+```text
+Operational Observer
+```
+
+A plain `Observer` role may authenticate successfully but can return HTTP `403` when reading policy endpoints.
+
+The script needs read access to policies, settings policies, targets, search, actions, and optionally audit logs.
+
+Recommended access:
+
+* Role: `Operational Observer`
+* Scope: environment, group, or target scope that includes the policies and entities to be audited
+
+The script is read-only, but the user must still be allowed to view policies through the Turbonomic UI/API.
+
+---
+
+## API Endpoints Used
+
+The script uses the following Turbonomic API endpoints:
+
+```text
+POST /api/v3/login
+GET  /api/v3/targets
+GET  /api/v3/search
+GET  /api/v3/audit
+GET  /api/v3/policies
+GET  /api/v3/settingspolicies
+GET  /api/v3/actions
+```
+
+Endpoint purpose:
+
+| Endpoint                   | Purpose                                    |
+| -------------------------- | ------------------------------------------ |
+| `/api/v3/login`            | Authenticate to Turbonomic                 |
+| `/api/v3/targets`          | Read configured targets, including vCenter |
+| `/api/v3/search`           | Count VMware-related entities              |
+| `/api/v3/audit`            | Read audit activity when available         |
+| `/api/v3/policies`         | Read placement policies                    |
+| `/api/v3/settingspolicies` | Read automation/settings policies          |
+| `/api/v3/actions`          | Check recent actions related to policies   |
+
+Note: `/api/v3/audit` may return `404` depending on the Turbonomic version, deployment, configuration, or user permissions. The script continues running if audit log data is unavailable, but activity-based classification will be less accurate.
+
+---
+
+## VMware Target Detection
+
+Some Turbonomic versions return VMware vCenter targets as:
+
+```text
+category = Hypervisor
+type     = vCenter
+status   = Discovered
+```
+
+Because of that, the script does not rely only on the string `vmware` in the target type. It also checks for `vCenter`, `Hypervisor`, and the target address/name.
+
+Target status values such as `Discovered` can appear even when the target is usable. Validate target health in the Turbonomic UI before treating it as disconnected.
 
 ---
 
 ## Requirements
 
-### Turbonomic Access
+### Python
 
-- **Minimum role required:** `Observer` (read-only)
-- The script performs **no write operations** — it only reads policy metadata, action history, audit logs, and inventory counts
-- Compatible with **Turbonomic 8.x** (on-premises or SaaS)
-- No agents, no probes, no configuration changes required
+Python 3.8 or later is recommended.
 
-### Python Environment
-
-- Python 3.8 or later
-- Library: `openpyxl`
+Required Python libraries:
 
 ```bash
-pip3 install openpyxl
+pip3 install requests openpyxl urllib3
+```
+
+Depending on the environment, these libraries may already be installed.
+
+---
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/juanpf-ha/turbonomic-stale-policy-audit.git
+cd turbonomic-stale-policy-audit
+```
+
+Install dependencies:
+
+```bash
+pip3 install requests openpyxl urllib3
+```
+
+Make the script executable if desired:
+
+```bash
+chmod +x stale_policies.py
 ```
 
 ---
 
 ## Usage
 
+Basic execution:
+
 ```bash
 python3 stale_policies.py \
-  --host https://your-turbonomic-instance.com \
-  --user observer_user \
-  --password YourPassword \
-  --days 90 \
-  --output client_name_stale_policies.xlsx
+  --host https://your-turbonomic-instance.example.com \
+  --user operational_observer_user \
+  --password 'YourPassword'
 ```
 
-### Parameters
+Recommended execution with explicit output:
 
-| Parameter | Required | Default | Description |
-|---|---|---|---|
-| `--host` | Yes | — | Turbonomic base URL |
-| `--user` | Yes | — | API username (Observer role minimum) |
-| `--password` | Yes | — | Password |
-| `--days` | No | `90` | Inactivity threshold in days |
-| `--output` | No | `vmware_stale_policies.xlsx` | Output filename |
-| `--verbose` | No | off | Print each policy name during processing |
+```bash
+python3 stale_policies.py \
+  --host https://your-turbonomic-instance.example.com \
+  --user operational_observer_user \
+  --password 'YourPassword' \
+  --days 90 \
+  --output /opt/turbonomic/turbo-audit/vmware_stale_policies.xlsx \
+  --verbose
+```
+
+---
+
+## Parameters
+
+| Parameter    | Required | Default                      | Description                         |
+| ------------ | -------: | ---------------------------- | ----------------------------------- |
+| `--host`     |      Yes | N/A                          | Turbonomic base URL                 |
+| `--user`     |      Yes | N/A                          | Turbonomic API username             |
+| `--password` |      Yes | N/A                          | Turbonomic password                 |
+| `--days`     |       No | `90`                         | Inactivity threshold in days        |
+| `--output`   |       No | `vmware_stale_policies.xlsx` | Excel output file                   |
+| `--verbose`  |       No | disabled                     | Print additional processing details |
 
 ---
 
 ## Output
 
-The script exports an Excel file to the current directory and copies it to `~/Downloads`.
+The script generates an Excel workbook.
 
-### Sheet: Summary
-High-level counts with environment context: connected VMware targets, entity inventory, and policy audit results by classification.
+Default output:
 
-### Sheet: DELETE
-Policies safe to remove with justification. Typical findings:
-- Disabled test/sandbox policies created by individual users
-- Auto-generated Cloud Tier Exclusion policies from disconnected Azure or AWS targets
-- Orphaned AzureScaleSet and AvailabilitySet policies pointing to deleted resources
+```text
+vmware_stale_policies.xlsx
+```
 
-### Sheet: REVIEW
-Policies requiring a human decision before acting:
-- Policies with empty scope (no entities assigned)
-- Policies absent from the audit log for the entire analysis period
-- Disabled policies that may be intentional (maintenance windows, seasonal schedules)
+If `--output` is an absolute path, the file is written to that location.
 
-### Sheet: All Policies
-Complete list color-coded by classification: red = DELETE, yellow = REVIEW, green = KEEP.
+If `--output` is only a filename, the script writes the report under:
 
----
+```text
+~/turbo-audit/
+```
 
-## What "Non-Invasive" Means
+Depending on the local copy logic, the script may also copy the file one directory above the execution path.
 
-| Action | Performed |
-|---|---|
-| Read policy list | Yes |
-| Read action history | Yes |
-| Read audit log | Yes |
-| Read target status | Yes |
-| Read entity counts | Yes |
-| Create policies | **No** |
-| Modify policies | **No** |
-| Delete policies | **No** |
-| Execute actions | **No** |
+Example:
 
-The script never modifies the Turbonomic environment. All deletions identified must be performed manually by an authorized administrator after reviewing the report.
-
----
-
-## Customizing Classification Patterns
-
-Edit these lists at the top of the script before running in a new client environment:
-
-```python
-TEST_NAME_PATTERNS = [
-    "test", "demo", "temp", "tmp", "sandbox",
-    "poc", "pilot", "trial", "dev-", "qa-", "staging-"
-]
-
-AUTOGEN_PATTERNS = [
-    "cloud compute tier exclusion policy",
-    "consistent scaling policy",
-    "rds tier exclusion",
-    "rds performance insights",
-    "azure app service plan"
-]
-
-ORPHAN_PATTERNS = [
-    "availabilityset::",
-    "azurescaleset::"
-]
+```text
+Report exported: /opt/turbonomic/turbo-audit/vmware_stale_policies.xlsx
+Copied to: /opt/turbonomic/vmware_stale_policies.xlsx
 ```
 
 ---
 
-## Tested On
+## Excel Sheets
 
-- Turbonomic 8.x on-premises and SaaS (IBM Turbonomic)
-- Python 3.10, 3.11, 3.13
-- macOS, Linux
+The workbook includes these sheets:
+
+| Sheet                | Description                                                                      |
+| -------------------- | -------------------------------------------------------------------------------- |
+| `Summary`            | General execution summary, target count, entity count, and classification totals |
+| `DELETE`             | Policies classified as likely safe to remove                                     |
+| `REVIEW`             | Policies that require manual validation                                          |
+| `All Policies`       | Full list of flagged policies                                                    |
+| `VMware Environment` | VMware/vCenter target and inventory context                                      |
+
+---
+
+## Classification Logic
+
+Each policy is classified into one of three categories:
+
+| Classification | Meaning                                  |
+| -------------- | ---------------------------------------- |
+| `DELETE`       | Candidate for deletion after validation  |
+| `REVIEW`       | Requires manual review before any action |
+| `KEEP`         | Should be retained                       |
+
+Common reasons detected:
+
+* Disabled policy
+* No recent actions in the selected period
+* Not found in audit log
+* Empty scope
+* Test/demo/sandbox naming pattern
+* Auto-generated or orphan-like naming pattern
+* Built-in/default policy
+
+Important: classification is advisory only. Deletions must always be reviewed and executed manually by a Turbonomic administrator.
+
+---
+
+## Non-Invasive Behavior
+
+The script performs read-only operations.
+
+| Operation              |           Performed |
+| ---------------------- | ------------------: |
+| Read targets           |                 Yes |
+| Read entity counts     |                 Yes |
+| Read policies          |                 Yes |
+| Read settings policies |                 Yes |
+| Read action history    |                 Yes |
+| Read audit log         | Yes, when available |
+| Create policies        |                  No |
+| Modify policies        |                  No |
+| Delete policies        |                  No |
+| Execute actions        |                  No |
+
+---
+
+## Troubleshooting
+
+### Authentication works but policies are not exported
+
+If authentication succeeds but policies are not listed, check the API status codes.
+
+A plain `Observer` role may return:
+
+```text
+HTTP 403
+```
+
+for:
+
+```text
+/api/v3/policies
+/api/v3/settingspolicies
+```
+
+Use a user with the `Operational Observer` role or higher.
+
+---
+
+### Audit log unavailable: 404
+
+This message means the script could not read:
+
+```text
+/api/v3/audit
+```
+
+Example:
+
+```text
+Audit log unavailable: 404
+```
+
+The script continues running, but the fields related to audit activity may be empty or less accurate.
+
+---
+
+### Proxy issues
+
+If the environment has proxy variables configured and the Turbonomic URL should be accessed directly, unset proxy variables or configure `NO_PROXY`.
+
+Example:
+
+```bash
+unset http_proxy
+unset https_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
+unset all_proxy
+unset ALL_PROXY
+
+export NO_PROXY="your-turbonomic-instance.example.com,.example.com,localhost,127.0.0.1"
+export no_proxy="$NO_PROXY"
+```
+
+The script also disables environment proxy usage through `requests` when `session.trust_env = False` is configured.
+
+---
+
+### Non-UTF-8 Python source error
+
+If Python returns an error like:
+
+```text
+SyntaxError: Non-UTF-8 code starting with ...
+```
+
+convert the script to UTF-8:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("stale_policies.py")
+raw = p.read_bytes()
+
+for enc in ("utf-8", "cp1252", "latin-1"):
+    try:
+        text = raw.decode(enc)
+        break
+    except UnicodeDecodeError:
+        continue
+else:
+    raise SystemExit("Unable to detect encoding")
+
+text = text.replace("\r\n", "\n").replace("\r", "\n")
+p.write_text(text, encoding="utf-8")
+print("Converted stale_policies.py to UTF-8")
+PY
+
+python3 -m py_compile stale_policies.py
+```
+
+---
+
+## Example Run
+
+```bash
+python3 stale_policies.py \
+  --host https://turbonomic.example.com \
+  --user operational_observer \
+  --password 'password' \
+  --days 90 \
+  --output /opt/turbonomic/turbo-audit/vmware_stale_policies.xlsx \
+  --verbose
+```
+
+Expected result:
+
+```text
+Authentication successful
+Total VMware targets: 1
+Total policies: 137
+Total settings policies: 78
+TOTAL flagged: 215
+Report exported: /opt/turbonomic/turbo-audit/vmware_stale_policies.xlsx
+```
+
+---
+
+## Security Notes
+
+Avoid passing passwords directly in shell history on shared systems.
+
+For safer execution, use a temporary environment variable:
+
+```bash
+export TURBO_PASSWORD='YourPassword'
+
+python3 stale_policies.py \
+  --host https://your-turbonomic-instance.example.com \
+  --user operational_observer_user \
+  --password "$TURBO_PASSWORD"
+
+unset TURBO_PASSWORD
+```
 
 ---
 
