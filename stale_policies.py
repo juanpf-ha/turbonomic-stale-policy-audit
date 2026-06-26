@@ -85,14 +85,38 @@ def classify_vmware_policy(name, enabled, entity_type, reasons_str, scope_count,
             pass
     return "REVIEW", "Review manually - may still be relevant for VMware environment"
 
+def unwrap_list_response(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("results", "content", "targets", "items", "data", "targetList"):
+            if key in payload and isinstance(payload[key], list):
+                return payload[key]
+    return []
+
+
 def analyze_vmware_targets(session):
     print("\n-- VMware vCenter Targets ---------------------------")
     try:
         r = session.get(f"{TURBO_HOST}/api/v3/targets")
         if r.status_code == 200:
-            targets = r.json()
-            vmware_targets = [t for t in targets if t.get("category") == "Hypervisor"
-                            and "vmware" in t.get("type", "").lower()]
+            targets = unwrap_list_response(r.json())
+            vmware_targets = []
+            for t in targets:
+                category = str(t.get("category", "")).lower()
+                type_name = str(t.get("type", "")).lower()
+                display_name = str(t.get("displayName", "")).lower()
+                if (
+                    "vmware" in type_name
+                    or "vcenter" in type_name
+                    or "vsphere" in type_name
+                    or "vmware" in display_name
+                    or "vcenter" in display_name
+                    or "vsphere" in display_name
+                    or category == "hypervisor"
+                    or category == "infrastructure"
+                ):
+                    vmware_targets.append(t)
             print(f"  Total VMware targets: {len(vmware_targets)}")
             disconnected = []
             for target in vmware_targets:
@@ -130,7 +154,7 @@ def get_vmware_entity_counts(session):
     print(f"  Total VMware entities: {total}")
     return entity_counts
 
-def generate_excel_report(results, vmware_targets, disconnected_targets, entity_counts):
+def generate_excel_report(results, vmware_targets, disconnected_targets, entity_counts, output_file):
     COLORS = {"DELETE": "FFCCCC", "REVIEW": "FFF2CC", "KEEP": "CCFFCC"}
     HDR_FILL = PatternFill("solid", fgColor="1F4E79")
     HDR_FONT = Font(bold=True, color="FFFFFF", name="Arial", size=10)
@@ -141,6 +165,9 @@ def generate_excel_report(results, vmware_targets, disconnected_targets, entity_
     ]
     col_widths = [10, 60, 18, 50, 20, 10, 12, 13, 20, 50, 38]
     order = ["DELETE", "REVIEW", "KEEP"]
+
+    output_path = Path(output_file).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     wb = Workbook()
 
@@ -243,7 +270,9 @@ def generate_excel_report(results, vmware_targets, disconnected_targets, entity_
     ws_vmware.column_dimensions["B"].width = 20
     ws_vmware.column_dimensions["C"].width = 38
 
-    wb.save(OUTPUT_FILE)
+    wb.save(output_path)
+    return output_path
+
 
 def main():
     print("=" * 70)
@@ -395,9 +424,10 @@ def main():
     print(f"  KEEP              : {len(to_keep)}")
     print(f"{'=' * 70}\n")
 
-    generate_excel_report(results, vmware_targets, disconnected_targets, entity_counts)
-    print(f"Report exported: ~/turbo-audit/{OUTPUT_FILE}")
+    output_path = generate_excel_report(results, vmware_targets, disconnected_targets, entity_counts, OUTPUT_FILE)
+    print(f"Report exported: {output_path.resolve()}")
     print("Sheets: 'Summary' | 'DELETE' | 'REVIEW' | 'All Policies' | 'VMware Environment'")
+    return output_path
 
 def get_downloads_folder():
     """Detecta la carpeta de descargas independientemente del idioma del sistema"""
@@ -420,8 +450,14 @@ def get_downloads_folder():
     return home
 
 if __name__ == "__main__":
-    main()
-    
-    _dest = get_downloads_folder() / OUTPUT_FILE
-    shutil.copy2(OUTPUT_FILE, _dest)
-    print(f"Copied to: {_dest}")
+    report_path = main()
+    download_folder = get_downloads_folder()
+    download_folder.mkdir(parents=True, exist_ok=True)
+    _dest = download_folder / report_path.name
+    try:
+        shutil.copy2(report_path, _dest)
+        print(f"Copied to: {_dest}")
+    except FileNotFoundError:
+        print(f"Unable to copy report: {report_path} not found")
+    except Exception as exc:
+        print(f"Unable to copy report to downloads: {exc}")
