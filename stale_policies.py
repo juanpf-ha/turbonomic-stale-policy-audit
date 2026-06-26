@@ -143,6 +143,18 @@ def parse_args() -> argparse.Namespace:
         help="Allow requests to honor http_proxy/https_proxy/NO_PROXY variables",
     )
     parser.add_argument(
+        "--inventory-page-size",
+        type=int,
+        default=500,
+        help="Page size for /api/v3/search inventory counts. Default: 500, matching observed Turbonomic page cap.",
+    )
+    parser.add_argument(
+        "--inventory-max-pages",
+        type=int,
+        default=1000,
+        help="Safety limit for inventory pagination per entity type. Default: 1000.",
+    )
+    parser.add_argument(
         "--use-admin-auditlogs",
         action="store_true",
         help="Download and parse /api/v3/admin/auditlogs. Usually requires Administrator or Site Administrator.",
@@ -163,6 +175,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Maximum audit log match lines kept per policy",
+    )
+    parser.add_argument(
+        "--include-detail-sheets",
+        action="store_true",
+        help=(
+            "Include technical detail worksheets such as Action Modes, Scope Analysis, "
+            "Policy Conflicts, Audit Log Matches and Snapshot Changes. By default, "
+            "the Excel report stays concise and omits those sheets."
+        ),
     )
     return parser.parse_args()
 
@@ -405,110 +426,122 @@ def analyze_vmware_targets(session: requests.Session, host: str) -> tuple[list[d
         print("  All VMware/vCenter targets are in an accepted state")
     return vmware_targets, not_accepted
 
-def count_entities_by_search(
+
+def unwrap_search_items(data: Any) -> list[dict[str, Any]]:
+    """Return entity items from /api/v3/search responses across known shapes."""
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        for key in ("items", "content", "results", "data", "entities"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+def count_entities_by_search_cursor(
     session: requests.Session,
     host: str,
     entity_type: str,
     args: argparse.Namespace,
-    page_limit: int = 10000,
 ) -> tuple[int, str]:
     """
-    Count entities returned by /api/v3/search for a given entity type.
+    Count inventory entities using /api/v3/search with numeric cursor pagination.
 
-    Important:
-    /api/v3/search?types=X&limit=1 does not return the total inventory count.
-    It only returns one matching element. Therefore, counting len(response)
-    with limit=1 is incorrect.
+    Important finding from this environment:
+      * offset is ignored by /api/v3/search.
+      * cursor=0,500,1000,... returns different pages.
+      * a single call is capped at 500 rows, so len(first_page) is not the total.
 
-    This function first tries a high limit and uses any explicit total/count
-    field if the API returns one. If the response is a list, it counts the
-    returned items. For environments larger than page_limit, increase
-    page_limit or add cursor-based pagination after validating the local
-    Swagger response shape.
+    This function walks cursor values by adding the number of returned items until
+    the API returns a page smaller than the requested page size or until a safety
+    limit is reached.
     """
-    status, data, text = api_get_json(
-        session,
-        f"{host}/api/v3/search",
-        params={"types": entity_type, "limit": page_limit},
-        timeout=180,
+    page_size = max(1, int(getattr(args, "inventory_page_size", 500) or 500))
+    max_pages = max(1, int(getattr(args, "inventory_max_pages", 1000) or 1000))
+
+    total = 0
+    cursor = 0
+    pages = 0
+    seen_uuids: set[str] = set()
+    duplicate_pages = 0
+    last_status = None
+    stopped_reason = "completed"
+
+    while pages < max_pages:
+        params = {
+            "types": entity_type,
+            "limit": page_size,
+            "cursor": cursor,
+        }
+
+        response = session.get(f"{host}/api/v3/search", params=params, timeout=180)
+        last_status = response.status_code
+
+        if response.status_code != 200:
+            return total, f"HTTP {response.status_code}: {short_text(response.text, 200)}"
+
+        try:
+            data = response.json()
+        except Exception:
+            return total, f"HTTP 200 but JSON parse failed: {short_text(response.text, 200)}"
+
+        items = unwrap_search_items(data)
+        page_count = len(items)
+        pages += 1
+
+        if page_count == 0:
+            stopped_reason = "empty page"
+            break
+
+        page_uuids = [str(x.get("uuid")) for x in items if x.get("uuid") is not None]
+        new_uuid_count = sum(1 for u in page_uuids if u not in seen_uuids)
+
+        # If the API starts returning the same page repeatedly, stop rather than
+        # overcounting. This also protects us if cursor behavior changes.
+        if page_uuids and new_uuid_count == 0:
+            duplicate_pages += 1
+            stopped_reason = "duplicate page detected"
+            break
+
+        if page_uuids:
+            for u in page_uuids:
+                seen_uuids.add(u)
+            total += new_uuid_count
+        else:
+            # Fallback for responses without UUIDs.
+            total += page_count
+
+        if page_count < page_size:
+            stopped_reason = "last page"
+            break
+
+        cursor += page_count
+
+    else:
+        stopped_reason = f"max pages reached ({max_pages})"
+
+    detail = (
+        f"HTTP {last_status} pages={pages} page_size={page_size} "
+        f"cursor_pages reason={stopped_reason}"
     )
+    if duplicate_pages:
+        detail += " WARNING: duplicate page detected"
+    if pages >= max_pages:
+        detail += " WARNING: count may be truncated"
 
-    if status != 200:
-        return 0, f"HTTP {status}: {short_text(text, 200)}"
-
-    if isinstance(data, dict):
-        for key in ("count", "total", "totalCount", "total_count"):
-            if isinstance(data.get(key), int):
-                return int(data[key]), f"HTTP 200 total field={key}"
-
-        items = unwrap_collection(data)
-        count = len(items)
-
-        # Best-effort cursor visibility for troubleshooting
-        cursor = (
-            data.get("cursor")
-            or data.get("nextCursor")
-            or data.get("next_cursor")
-            or data.get("next")
-        )
-        if cursor:
-            return count, f"HTTP 200 partial page count={count}, cursor present"
-
-        return count, f"HTTP 200 dict collection count={count}"
-
-    if isinstance(data, list):
-        count = len(data)
-        if count >= page_limit:
-            return count, f"HTTP 200 list count={count}, may be truncated by limit={page_limit}"
-        return count, "HTTP 200 list"
-
-    return 0, f"HTTP 200 unexpected response type={type(data).__name__}"
+    return total, detail
 
 
 def get_vmware_entity_counts(session: requests.Session, host: str, args: argparse.Namespace) -> dict[str, int]:
     print("\n-- VMware Entity Inventory --------------------------")
     counts: dict[str, int] = {}
-
     for entity_type in VMWARE_ENTITY_TYPES:
-        count, detail = count_entities_by_search(
-            session=session,
-            host=host,
-            entity_type=entity_type,
-            args=args,
-            page_limit=20000,
-        )
+        count, detail = count_entities_by_search_cursor(session, host, entity_type, args)
         counts[entity_type] = count
         vprint(args, f"  {entity_type}: {count} ({detail})")
-
     print(f"  Total VMware entities: {sum(counts.values())}")
     return counts
-
-
-    print("\n-- VMware Entity Inventory --------------------------")
-    counts: dict[str, int] = {}
-    for entity_type in VMWARE_ENTITY_TYPES:
-        status, data, _ = api_get_json(
-            session,
-            f"{host}/api/v3/search",
-            params={"types": entity_type, "limit": 1},
-            timeout=120,
-        )
-        count = 0
-        if status == 200:
-            if isinstance(data, dict):
-                for k in ("count", "total", "totalCount"):
-                    if isinstance(data.get(k), int):
-                        count = int(data[k])
-                        break
-                else:
-                    count = len(unwrap_collection(data))
-            elif isinstance(data, list):
-                count = len(data)
-        counts[entity_type] = count
-        vprint(args, f"  {entity_type}: {count} (HTTP {status})")
-    print(f"  Total VMware entities: {sum(counts.values())}")
-    return counts
-
 
 def fetch_settings_policies(session: requests.Session, host: str, args: argparse.Namespace) -> tuple[list[dict[str, Any]], int, str]:
     print("\n-- Automation / Settings Policies -------------------")
@@ -1206,6 +1239,111 @@ def append_rows(ws, rows: list[dict[str, Any]], headers: list[str]) -> None:
         ws.column_dimensions[get_column_letter(i)].width = width
 
 
+def compact_source(source: str) -> str:
+    mapping = {
+        "settings_policy": "Automation/Settings",
+        "placement_policy_endpoint": "Placement/Policy",
+    }
+    return mapping.get(source or "", source or "")
+
+
+def compact_bool(value: Any) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    text = str(value)
+    if text.lower() == "true":
+        return "yes"
+    if text.lower() == "false":
+        return "no"
+    return text
+
+
+def compact_scope(row: dict[str, Any]) -> str:
+    if str(row.get("default_policy", "")).lower() == "true":
+        return "default policy"
+
+    scope_count = int(row.get("scope_count") or 0)
+    unresolved = int(row.get("unresolved_scopes") or 0)
+    empty = int(row.get("empty_groups") or 0)
+
+    if scope_count == 0:
+        return "no scope"
+
+    parts = [f"{scope_count} scope(s)"]
+    if empty:
+        parts.append(f"{empty} empty group(s)")
+    if unresolved:
+        parts.append(f"{unresolved} unresolved")
+    return "; ".join(parts)
+
+
+def compact_settings(row: dict[str, Any]) -> str:
+    compared = int(row.get("settings_compared") or 0)
+    diffs = int(row.get("settings_diff_count") or 0)
+    modes = int(row.get("action_mode_count") or 0)
+
+    parts: list[str] = []
+    if compared:
+        parts.append(f"{diffs}/{compared} changed")
+    elif diffs:
+        parts.append(f"{diffs} changed")
+
+    if modes:
+        parts.append(f"{modes} action mode(s)")
+
+    return "; ".join(parts) if parts else "-"
+
+
+def compact_audit(row: dict[str, Any]) -> str:
+    matches = int(row.get("audit_matches") or 0)
+    action_check = str(row.get("action_check") or "")
+    parts: list[str] = []
+    if matches:
+        parts.append(f"{matches} audit match(es)")
+    if action_check and action_check not in {"ok", "skipped", ""}:
+        parts.append(action_check)
+    return "; ".join(parts) if parts else "-"
+
+
+def make_compact_policy_rows(rows: list[dict[str, Any]], include_id: bool = False) -> list[dict[str, Any]]:
+    compact_rows: list[dict[str, Any]] = []
+    for row in rows:
+        compact = {
+            "classification": row.get("classification", ""),
+            "policy": row.get("name", ""),
+            "source": compact_source(str(row.get("source", ""))),
+            "entity": row.get("entityType", ""),
+            "enabled": compact_bool(row.get("enabled", "")),
+            "scope": compact_scope(row),
+            "settings": compact_settings(row),
+            "audit": compact_audit(row),
+            "recommendation": row.get("justification", ""),
+        }
+        if include_id:
+            compact["id"] = row.get("id", "")
+        compact_rows.append(compact)
+    return compact_rows
+
+
+def create_compact_sheet(wb: Workbook, title: str, rows: list[dict[str, Any]], include_id: bool = False) -> None:
+    if not rows:
+        return
+    safe_title = title[:31]
+    ws = wb.create_sheet(safe_title)
+    compact_rows = make_compact_policy_rows(rows, include_id=include_id)
+    headers = ["classification", "policy", "source", "entity", "enabled", "scope", "settings", "audit", "recommendation"]
+    if include_id:
+        headers.append("id")
+    append_rows(ws, compact_rows, headers)
+
+
+def create_detail_sheet(wb: Workbook, title: str, rows: list[dict[str, Any]], headers: list[str]) -> None:
+    if not rows:
+        return
+    ws = wb.create_sheet(title[:31])
+    append_rows(ws, rows, headers)
+
+
 def generate_excel_report(
     output_path: Path,
     metadata: dict[str, Any],
@@ -1218,82 +1356,119 @@ def generate_excel_report(
     vmware_targets: list[dict[str, Any]],
     not_accepted_targets: list[dict[str, Any]],
     entity_counts: dict[str, int],
-) -> Path:
+) -> tuple[Path, list[str]]:
     wb = Workbook()
     ws = wb.active
     ws.title = "Summary"
+
+    class_counts = {
+        cls: sum(1 for r in policy_rows if r.get("classification") == cls)
+        for cls in CLASS_ORDER
+    }
+    vmware_specific = sum(1 for r in policy_rows if r.get("vmware_specific") == "True")
+    other_types = len(policy_rows) - vmware_specific
 
     summary_rows = [
         ["Turbonomic Stale Policy Audit - VMware On-Premises"],
         [],
         ["Host", metadata.get("host")],
         ["Analysis Date", metadata.get("analysis_date")],
+        ["User / Roles", f"{metadata.get('user', '')} / {metadata.get('roles', '')}"],
         ["Inactivity Threshold", f"{metadata.get('days')} days"],
-        ["Audit Requested", metadata.get("audit_requested")],
-        ["Audit Available", metadata.get("audit_available")],
-        ["Audit Message", metadata.get("audit_message")],
-        ["Audit Artifact", metadata.get("audit_artifact")],
-        ["Snapshot", metadata.get("snapshot_path")],
         [],
-        ["VMware Environment"],
+        ["Environment"],
         ["VMware Targets", len(vmware_targets)],
         ["Targets Not Accepted", len(not_accepted_targets)],
         ["Total VMware Entities", sum(entity_counts.values())],
+        ["Virtual Machines", entity_counts.get("VirtualMachine", 0)],
+        ["Physical Machines", entity_counts.get("PhysicalMachine", 0)],
+        ["Storage", entity_counts.get("Storage", 0)],
+        [],
+        ["Policy Summary"],
+        ["Total Policies / Rows", len(policy_rows)],
+        ["VMware-specific", vmware_specific],
+        ["Other Types", other_types],
+        ["Candidate Delete", class_counts.get("CANDIDATE_DELETE", 0)],
+        ["Review", class_counts.get("REVIEW", 0)],
+        ["Keep", class_counts.get("KEEP", 0)],
+        ["Info", class_counts.get("INFO", 0)],
     ]
-    for etype, count in entity_counts.items():
-        summary_rows.append([f"  {etype}", count])
+    if class_counts.get("UNKNOWN", 0):
+        summary_rows.append(["Unknown", class_counts["UNKNOWN"]])
+
     summary_rows.extend([
         [],
-        ["Policy Audit Results"],
-        ["TOTAL rows", len(policy_rows)],
-        ["VMware-specific", sum(1 for r in policy_rows if r.get("vmware_specific") == "True")],
-        ["Other types", sum(1 for r in policy_rows if r.get("vmware_specific") != "True")],
+        ["Audit / Snapshot"],
+        ["Admin Auditlogs", metadata.get("audit_message") if metadata.get("audit_requested") == "True" else "not requested"],
+        ["Audit Matches", len(audit_match_rows)],
+        ["Snapshot", metadata.get("snapshot_path")],
     ])
-    for cls in CLASS_ORDER:
-        summary_rows.append([cls, sum(1 for r in policy_rows if r.get("classification") == cls)])
-    summary_rows.extend([
-        [],
-        ["Additional Analysis"],
-        ["Action mode rows", len(action_mode_rows)],
-        ["Scope analysis rows", len(scope_rows)],
-        ["Conflict rows", len(conflict_rows)],
-        ["Audit log match rows", len(audit_match_rows)],
-        ["Snapshot change rows", len(snapshot_changes)],
-    ])
+
+    if metadata.get("include_detail_sheets") == "True":
+        summary_rows.extend([
+            [],
+            ["Technical Detail Sheets"],
+            ["Action Mode Rows", len(action_mode_rows)],
+            ["Scope Rows", len(scope_rows)],
+            ["Conflict Rows", len(conflict_rows)],
+            ["Snapshot Changes", len(snapshot_changes)],
+        ])
+
     for row in summary_rows:
         ws.append(row)
     ws["A1"].font = Font(bold=True, size=14, color="1F4E79")
     ws.column_dimensions["A"].width = 34
     ws.column_dimensions["B"].width = 100
 
-    policy_headers = [
-        "classification", "source", "vmware_specific", "name", "entityType", "enabled",
-        "default_policy", "scope_count", "unresolved_scopes", "empty_groups",
-        "settings_diff_count", "settings_compared", "action_mode_count", "audit_matches",
-        "action_check", "reasons", "justification", "last_modified", "id",
-    ]
+    # Main worksheets: only create sheets that have rows.
     for cls in CLASS_ORDER:
-        ws_cls = wb.create_sheet(cls[:31])
-        append_rows(ws_cls, [r for r in policy_rows if r.get("classification") == cls], policy_headers)
+        cls_rows = [r for r in policy_rows if r.get("classification") == cls]
+        create_compact_sheet(wb, cls, cls_rows, include_id=False)
 
-    ws_all = wb.create_sheet("All Policies")
-    sorted_rows = sorted(policy_rows, key=lambda r: (CLASS_ORDER.index(r.get("classification", "UNKNOWN")) if r.get("classification") in CLASS_ORDER else 99, r.get("source", ""), r.get("name", "")))
-    append_rows(ws_all, sorted_rows, policy_headers)
+    sorted_rows = sorted(
+        policy_rows,
+        key=lambda r: (
+            CLASS_ORDER.index(r.get("classification", "UNKNOWN"))
+            if r.get("classification") in CLASS_ORDER
+            else 99,
+            r.get("source", ""),
+            r.get("name", ""),
+        ),
+    )
+    create_compact_sheet(wb, "All Policies", sorted_rows, include_id=True)
 
-    ws_modes = wb.create_sheet("Action Modes")
-    append_rows(ws_modes, action_mode_rows, ["policy_name", "entityType", "setting_name", "setting_key", "value", "default_value", "risk", "path", "policy_id"])
-
-    ws_scope = wb.create_sheet("Scope Analysis")
-    append_rows(ws_scope, scope_rows, ["policy_name", "source", "entityType", "scope_name", "scope_uuid", "exists", "member_count", "groupType", "status", "policy_id"])
-
-    ws_conflicts = wb.create_sheet("Policy Conflicts")
-    append_rows(ws_conflicts, conflict_rows, ["policy_name", "entityType", "scope_key", "setting_name", "setting_key", "value", "conflict_count", "distinct_values", "policy_id"])
-
-    ws_audit = wb.create_sheet("Audit Log Matches")
-    append_rows(ws_audit, audit_match_rows, ["policy_name", "source", "match_type", "file", "line", "text", "policy_id"])
-
-    ws_changes = wb.create_sheet("Snapshot Changes")
-    append_rows(ws_changes, snapshot_changes, ["change", "name", "details", "id"])
+    # Optional technical sheets. They are disabled by default and never created when empty.
+    if metadata.get("include_detail_sheets") == "True":
+        create_detail_sheet(
+            wb,
+            "Action Modes",
+            action_mode_rows,
+            ["policy_name", "entityType", "setting_name", "value", "default_value", "risk", "policy_id"],
+        )
+        create_detail_sheet(
+            wb,
+            "Scope Analysis",
+            scope_rows,
+            ["policy_name", "source", "entityType", "scope_name", "exists", "member_count", "status", "policy_id"],
+        )
+        create_detail_sheet(
+            wb,
+            "Policy Conflicts",
+            conflict_rows,
+            ["policy_name", "entityType", "scope_key", "setting_name", "value", "conflict_count", "distinct_values", "policy_id"],
+        )
+        create_detail_sheet(
+            wb,
+            "Audit Log Matches",
+            audit_match_rows,
+            ["policy_name", "source", "match_type", "file", "line", "text", "policy_id"],
+        )
+        create_detail_sheet(
+            wb,
+            "Snapshot Changes",
+            snapshot_changes,
+            ["change", "name", "details", "id"],
+        )
 
     ws_vmware = wb.create_sheet("VMware Environment")
     ws_vmware.append(["VMware vCenter Targets"])
@@ -1315,8 +1490,7 @@ def generate_excel_report(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
-    return output_path
-
+    return output_path, wb.sheetnames
 
 def copy_to_parent_if_possible(output_path: Path) -> Path | None:
     try:
@@ -1481,6 +1655,7 @@ def main() -> None:
         "audit_message": audit_result.get("message"),
         "audit_artifact": audit_result.get("path"),
         "snapshot_path": "",
+        "include_detail_sheets": str(bool(args.include_detail_sheets)),
     }
 
     snapshot_changes: list[dict[str, Any]] = []
@@ -1518,7 +1693,7 @@ def main() -> None:
     print(f"  Snapshot changes  : {len(snapshot_changes)}")
     print("=" * 84)
 
-    final_path = generate_excel_report(
+    final_path, sheet_names = generate_excel_report(
         output_path,
         metadata,
         policy_rows,
@@ -1535,11 +1710,7 @@ def main() -> None:
     copied = copy_to_parent_if_possible(final_path)
     if copied:
         print(f"Copied to: {copied}")
-    print(
-        "Sheets: 'Summary' | 'CANDIDATE_DELETE' | 'REVIEW' | 'KEEP' | 'INFO' | 'UNKNOWN' | "
-        "'All Policies' | 'Action Modes' | 'Scope Analysis' | 'Policy Conflicts' | "
-        "'Audit Log Matches' | 'Snapshot Changes' | 'VMware Environment'"
-    )
+    print("Sheets: " + " | ".join(sheet_names))
 
 
 if __name__ == "__main__":
