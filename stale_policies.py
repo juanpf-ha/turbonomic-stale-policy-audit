@@ -3,35 +3,41 @@
 """
 Turbonomic Stale Policy Audit - VMware On-Premises Focus
 
-Read-only audit script for Turbonomic policies. It is intentionally conservative:
-missing audit/action data is not treated as proof that a policy is stale.
+Read-only audit tool for Turbonomic policies.
 
-Main data sources:
-  - /api/v3/targets
-  - /api/v3/search
-  - /api/v3/audit                 (optional; can be unavailable)
-  - /api/v3/settingspolicies      (automation/settings policies)
-  - /api/v3/settingspolicies?only_defaults=true
-  - /api/v3/policies              (placement/policy endpoint, not automation policies)
-  - /api/v3/actions               (best-effort; version-dependent)
-  - /api/v3/groups/{uuid}         (best-effort scope validation)
+Main goals:
+  * Inventory VMware/vCenter targets and VMware-related entities.
+  * Read Automation / Settings Policies from /api/v3/settingspolicies.
+  * Read Placement / Policy endpoint data from /api/v3/policies.
+  * Compare custom settings policies against defaults when available.
+  * Analyze scopes, action modes, duplicated/conflicting settings, and snapshots.
+  * Optionally download and parse admin audit logs from /api/v3/admin/auditlogs.
 
-The script does not create, modify, delete, or execute anything in Turbonomic.
+Important:
+  * This script is read-only. It does not modify or delete policies.
+  * /api/v3/admin/auditlogs normally requires Administrator or Site Administrator
+    privileges and returns application/gzip, not JSON.
+  * If audit logs are unavailable, the script does not use that absence as a stale
+    signal.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
+import gzip
 import hashlib
+import io
 import json
 import os
 import re
-import sys
+import shutil
+import tarfile
+import tempfile
+import zipfile
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import requests
 import urllib3
@@ -41,68 +47,6 @@ from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
-
-parser = argparse.ArgumentParser(
-    description="Turbonomic Stale Policy Audit - VMware On-Premises Focus"
-)
-parser.add_argument("--host", required=True, help="Turbonomic host URL")
-parser.add_argument("--user", required=True, help="API username")
-parser.add_argument("--password", required=True, help="API password")
-parser.add_argument("--days", default=90, type=int, help="Inactivity threshold in days")
-parser.add_argument(
-    "--output",
-    default="vmware_stale_policies.xlsx",
-    help="Output Excel file. Relative paths are written under the current directory.",
-)
-parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
-parser.add_argument(
-    "--snapshot-dir",
-    default=None,
-    help="Directory for JSON snapshots. Default: <output-dir>/snapshots",
-)
-parser.add_argument(
-    "--no-snapshot",
-    action="store_true",
-    help="Do not write or compare JSON snapshots",
-)
-parser.add_argument(
-    "--skip-group-check",
-    action="store_true",
-    help="Do not call /api/v3/groups/{uuid} for scope validation",
-)
-parser.add_argument(
-    "--skip-action-check",
-    action="store_true",
-    help="Do not call /api/v3/actions for best-effort recent action checks",
-)
-parser.add_argument(
-    "--trust-env-proxy",
-    action="store_true",
-    help="Allow requests to use proxy variables from the environment. Default: disabled.",
-)
-
-args = parser.parse_args()
-
-TURBO_HOST = args.host.rstrip("/")
-USERNAME = args.user
-PASSWORD = args.password
-INACTIVITY_DAYS = args.days
-OUTPUT_FILE = args.output
-VERBOSE = args.verbose
-SKIP_GROUP_CHECK = args.skip_group_check
-SKIP_ACTION_CHECK = args.skip_action_check
-
-
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
-
-# VMware-relevant Turbonomic entity types. In the API, ESXi hosts are typically
-# represented as PhysicalMachine and vCenter datastores as Storage.
 VMWARE_ENTITY_TYPES = [
     "VirtualMachine",
     "PhysicalMachine",
@@ -113,67 +57,41 @@ VMWARE_ENTITY_TYPES = [
     "ResourcePool",
 ]
 
-TARGET_OK_STATUSES = {"validated", "discovered"}
+ACCEPTED_TARGET_STATES = {"validated", "discovered"}
+
+ACTION_MODE_VALUES = {
+    "AUTOMATIC",
+    "MANUAL",
+    "RECOMMEND",
+    "DISABLED",
+    "EXTERNAL_APPROVAL",
+}
 
 TEST_NAME_PATTERNS = [
     "test",
     "demo",
     "temp",
     "tmp",
+    "poc",
     "sandbox",
     "prueba",
-    "ejemplo",
-    "poc",
-    "pilot",
-    "trial",
-    "dev-",
-    "qa-",
-    "staging-",
+    "orphan",
+    "old",
+    "backup",
 ]
 
-ORPHAN_PATTERNS = [
-    "::deleted",
-    "::removed",
-    "::migrated",
-    "::decommissioned",
-    "old-vcenter",
-    "legacy-",
-    "retired-",
-    "deprecated",
-]
-
-DEFAULT_POLICY_PATTERNS = [
+GENERIC_NAMES_TO_IGNORE_FOR_AUDIT = {
     "default",
-    "defaults",
-    "system default",
-    "turbonomic default",
-]
-
-ACTION_MODE_VALUES = {
-    "DISABLED",
-    "RECOMMEND",
-    "MANUAL",
-    "AUTOMATIC",
-    "EXTERNAL_APPROVAL",
+    "global",
+    "policy",
+    "policies",
+    "automation",
+    "settings",
+    "placement",
 }
 
-ACTION_MODE_RISK = {
-    "AUTOMATIC": "HIGH",
-    "EXTERNAL_APPROVAL": "MEDIUM",
-    "MANUAL": "MEDIUM",
-    "RECOMMEND": "LOW",
-    "DISABLED": "INFO",
-}
-
-CLASSIFICATION_ORDER = [
-    "CANDIDATE_DELETE",
-    "REVIEW",
-    "KEEP",
-    "INFO",
-    "UNKNOWN",
-]
-
-CLASSIFICATION_COLORS = {
+CLASS_ORDER = ["CANDIDATE_DELETE", "REVIEW", "KEEP", "INFO", "UNKNOWN"]
+CLASS_COLORS = {
     "CANDIDATE_DELETE": "FFCCCC",
     "REVIEW": "FFF2CC",
     "KEEP": "CCFFCC",
@@ -182,87 +100,228 @@ CLASSIFICATION_COLORS = {
 }
 
 
-# -----------------------------------------------------------------------------
-# Generic helpers
-# -----------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Read-only Turbonomic stale policy audit with VMware focus."
+    )
+    parser.add_argument("--host", required=True, help="Turbonomic base URL")
+    parser.add_argument("--user", required=True, help="Turbonomic username")
+    parser.add_argument("--password", required=True, help="Turbonomic password")
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=90,
+        help="Inactivity threshold in days for best-effort action/audit analysis",
+    )
+    parser.add_argument(
+        "--output",
+        default="vmware_stale_policies.xlsx",
+        help="Excel output path. Relative paths are written under ~/turbo-audit.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Print verbose details")
+    parser.add_argument(
+        "--snapshot-dir",
+        default=None,
+        help="Directory for policy snapshots. Default: <output_dir>/snapshots",
+    )
+    parser.add_argument(
+        "--no-snapshot", action="store_true", help="Disable snapshot save/compare"
+    )
+    parser.add_argument(
+        "--skip-group-check",
+        action="store_true",
+        help="Skip best-effort group/scope lookup",
+    )
+    parser.add_argument(
+        "--skip-action-check",
+        action="store_true",
+        help="Skip best-effort /api/v3/actions policy checks",
+    )
+    parser.add_argument(
+        "--trust-env-proxy",
+        action="store_true",
+        help="Allow requests to honor http_proxy/https_proxy/NO_PROXY variables",
+    )
+    parser.add_argument(
+        "--use-admin-auditlogs",
+        action="store_true",
+        help="Download and parse /api/v3/admin/auditlogs. Usually requires Administrator or Site Administrator.",
+    )
+    parser.add_argument(
+        "--admin-audit-days",
+        type=int,
+        default=None,
+        help="Number of days for /api/v3/admin/auditlogs. Default: same as --days.",
+    )
+    parser.add_argument(
+        "--audit-artifact-dir",
+        default=None,
+        help="Directory to store downloaded audit log artifacts. Default: <output_dir>/auditlogs",
+    )
+    parser.add_argument(
+        "--max-audit-matches-per-policy",
+        type=int,
+        default=10,
+        help="Maximum audit log match lines kept per policy",
+    )
+    return parser.parse_args()
 
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def debug(message: str) -> None:
-    if VERBOSE:
-        print(message)
+def now_stamp() -> str:
+    return now_utc().strftime("%Y%m%d_%H%M%S")
 
 
-def normalize_string(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
+def short_text(text: str, limit: int = 1000) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
-def lower(value: Any) -> str:
-    return normalize_string(value).lower()
+def normalize_url(host: str) -> str:
+    return host.rstrip("/")
 
 
-def sanitize_sheet_name(name: str) -> str:
-    cleaned = re.sub(r"[\\/*?:\[\]]", "_", name)
-    return cleaned[:31]
+def resolve_output_path(output: str) -> Path:
+    p = Path(output).expanduser()
+    if not p.is_absolute():
+        out_dir = Path.home() / "turbo-audit"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / p.name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-def resolve_output_path(output_file: str) -> Path:
-    path = Path(output_file).expanduser()
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+def vprint(args: argparse.Namespace, msg: str) -> None:
+    if args.verbose:
+        print(msg)
 
 
-def unwrap_list_response(payload: Any) -> list[Any]:
-    """Return a list from API responses that may be a list or wrapped dict."""
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def create_session(args: argparse.Namespace) -> requests.Session:
+    s = requests.Session()
+    s.verify = False
+    s.trust_env = bool(args.trust_env_proxy)
+    return s
+
+
+def login(session: requests.Session, host: str, args: argparse.Namespace) -> dict[str, Any]:
+    print(f"\nConnecting to {host} ...")
+    r = session.post(
+        f"{host}/api/v3/login",
+        data={"username": args.user, "password": args.password},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        print(f"Authentication failed: HTTP {r.status_code}")
+        print(short_text(r.text))
+        raise SystemExit(1)
+    print("Authentication successful")
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
+def unwrap_collection(data: Any) -> list[Any]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
         for key in (
             "results",
             "content",
             "items",
             "data",
-            "targetList",
-            "targets",
+            "entities",
             "policies",
             "settingsPolicies",
+            "settingspolicies",
         ):
-            value = payload.get(key)
+            value = data.get(key)
             if isinstance(value, list):
                 return value
     return []
 
 
-def json_hash(obj: Any) -> str:
-    raw = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def get_first(obj: dict[str, Any], keys: list[str], default: Any = None) -> Any:
+    for k in keys:
+        if k in obj and obj.get(k) not in (None, ""):
+            return obj.get(k)
+    return default
 
 
-def api_get(session: requests.Session, endpoint: str, **kwargs: Any) -> requests.Response:
-    return session.get(f"{TURBO_HOST}{endpoint}", **kwargs)
+def get_policy_id(policy: dict[str, Any]) -> str:
+    return str(get_first(policy, ["uuid", "id", "policyId", "oid"], ""))
 
 
-def api_post(session: requests.Session, endpoint: str, **kwargs: Any) -> requests.Response:
-    return session.post(f"{TURBO_HOST}{endpoint}", **kwargs)
+def get_policy_name(policy: dict[str, Any]) -> str:
+    return str(get_first(policy, ["displayName", "name", "policyName", "uuid", "id"], "N/A"))
 
 
-def print_api_warning(label: str, response: requests.Response) -> None:
-    print(f"  Unable to retrieve {label}: HTTP {response.status_code}")
-    text = response.text or ""
-    if text:
-        print(f"  Response: {text[:500]}")
+def get_entity_type(policy: dict[str, Any]) -> str:
+    et = policy.get("entityType")
+    if isinstance(et, dict):
+        return str(get_first(et, ["value", "name", "displayName"], "UNKNOWN"))
+    return str(et or "UNKNOWN")
 
 
-# -----------------------------------------------------------------------------
-# Target helpers
-# -----------------------------------------------------------------------------
+def is_vmware_entity_type(entity_type: str) -> bool:
+    return entity_type in VMWARE_ENTITY_TYPES
+
+
+def get_enabled(policy: dict[str, Any]) -> bool:
+    if "enabled" in policy:
+        return bool(policy.get("enabled"))
+    if "disabled" in policy:
+        return not bool(policy.get("disabled"))
+    return True
+
+
+def get_scopes(policy: dict[str, Any]) -> list[Any]:
+    scopes = policy.get("scopes", policy.get("scope", []))
+    if isinstance(scopes, list):
+        return scopes
+    if scopes in (None, ""):
+        return []
+    return [scopes]
+
+
+def get_scope_uuid(scope: Any) -> str:
+    if isinstance(scope, str):
+        return scope
+    if isinstance(scope, dict):
+        return str(get_first(scope, ["uuid", "id", "groupUuid", "oid"], ""))
+    return ""
+
+
+def get_scope_name(scope: Any) -> str:
+    if isinstance(scope, dict):
+        return str(get_first(scope, ["displayName", "name", "uuid", "id"], ""))
+    return str(scope or "")
+
+
+def is_default_policy(policy: dict[str, Any], default_ids: set[str]) -> bool:
+    pid = get_policy_id(policy)
+    if pid and pid in default_ids:
+        return True
+    for k in ("default", "isDefault", "defaultPolicy", "readOnly", "systemPolicy"):
+        if bool(policy.get(k)):
+            return True
+    return False
+
+
+def name_has_test_pattern(name: str) -> bool:
+    lname = name.lower()
+    return any(re.search(rf"(^|[^a-z0-9]){re.escape(p)}([^a-z0-9]|$)", lname) for p in TEST_NAME_PATTERNS)
 
 
 def get_target_field(target: dict[str, Any], field_name: str) -> Any:
@@ -273,1562 +332,1215 @@ def get_target_field(target: dict[str, Any], field_name: str) -> Any:
 
 
 def is_vmware_target(target: dict[str, Any]) -> bool:
-    """
-    Detect VMware/vCenter targets.
-
-    Turbonomic commonly reports vCenter as category=Hypervisor and type=vCenter,
-    not as type=VMware.
-    """
-    category = lower(target.get("category"))
-    type_name = lower(target.get("type"))
-    display_name = lower(target.get("displayName") or target.get("name"))
-    address = lower(
+    category = str(target.get("category", "")).lower()
+    target_type = str(target.get("type", "")).lower()
+    display = str(target.get("displayName", target.get("name", ""))).lower()
+    address = str(
         get_target_field(target, "address")
         or get_target_field(target, "nameOrAddress")
-        or target.get("address")
-    )
+        or get_target_field(target, "host")
+        or ""
+    ).lower()
 
-    if category == "hypervisor" and type_name in {"vcenter", "vmware", "vsphere", "vmware vcenter"}:
+    if category == "hypervisor" and target_type in {"vcenter", "vmware", "vsphere", "vmware vcenter"}:
         return True
-
-    haystack = " ".join([type_name, display_name, address])
-    return any(token in haystack for token in ("vcenter", "vmware", "vsphere"))
-
-
-def is_target_ok(status: Any) -> bool:
-    return lower(status) in TARGET_OK_STATUSES
-
-
-# -----------------------------------------------------------------------------
-# Policy helpers
-# -----------------------------------------------------------------------------
-
-
-def policy_name(policy: dict[str, Any]) -> str:
-    return normalize_string(
-        policy.get("displayName")
-        or policy.get("name")
-        or policy.get("policyName")
-        or policy.get("uuid")
-        or "N/A"
-    )
-
-
-def policy_id(policy: dict[str, Any]) -> str:
-    return normalize_string(policy.get("uuid") or policy.get("id") or policy.get("policyUuid"))
-
-
-def policy_entity_type(policy: dict[str, Any]) -> str:
-    return normalize_string(policy.get("entityType") or policy.get("entity_type") or "UNKNOWN")
-
-
-def policy_enabled(policy: dict[str, Any]) -> bool:
-    """Turbonomic settings policies usually use disabled=false, not enabled=true."""
-    if "enabled" in policy:
-        return bool(policy.get("enabled"))
-    if "disabled" in policy:
-        return not bool(policy.get("disabled"))
-    return True
-
-
-def policy_scopes(policy: dict[str, Any]) -> list[Any]:
-    scopes = policy.get("scopes", policy.get("scope", []))
-    if scopes is None:
-        return []
-    if isinstance(scopes, list):
-        return scopes
-    if isinstance(scopes, dict):
-        return [scopes]
-    return []
-
-
-def extract_ref_uuid(ref: Any) -> str:
-    if isinstance(ref, str):
-        return ref
-    if isinstance(ref, dict):
-        for key in ("uuid", "id", "groupUuid", "targetId"):
-            if ref.get(key):
-                return str(ref[key])
-    return ""
-
-
-def extract_ref_name(ref: Any) -> str:
-    if isinstance(ref, dict):
-        return normalize_string(ref.get("displayName") or ref.get("name") or ref.get("uuid") or ref.get("id"))
-    return normalize_string(ref)
-
-
-def scope_ids(policy: dict[str, Any]) -> list[str]:
-    ids = []
-    for ref in policy_scopes(policy):
-        ref_id = extract_ref_uuid(ref)
-        if ref_id:
-            ids.append(ref_id)
-    return sorted(set(ids))
-
-
-def is_default_policy(policy: dict[str, Any], default_ids: set[str] | None = None) -> bool:
-    pid = policy_id(policy)
-    name = lower(policy_name(policy))
-    if default_ids and pid in default_ids:
+    if "vcenter" in target_type or "vmware" in target_type or "vsphere" in target_type:
         return True
-    if bool(policy.get("isDefault")) or bool(policy.get("default")):
+    if any(x in display for x in ("vcenter", "vcsa", "vsphere", "vmware")):
         return True
-    if name.endswith(" defaults") or name.endswith("defaults"):
+    if any(x in address for x in ("vcenter", "vcsa", "vsphere", "vmware")):
         return True
-    return any(pattern in name for pattern in DEFAULT_POLICY_PATTERNS)
+    return False
 
 
-def has_name_pattern(name: str, patterns: Iterable[str]) -> bool:
-    name_l = lower(name)
-    return any(pattern in name_l for pattern in patterns)
+def status_is_accepted(status: str) -> bool:
+    return str(status).strip().lower() in ACCEPTED_TARGET_STATES
 
 
-def parse_last_modified(value: Any) -> datetime | None:
-    if not value:
-        return None
-    if isinstance(value, (int, float)):
-        # Turbonomic often uses epoch milliseconds.
-        if value > 10_000_000_000:
-            return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
-        return datetime.fromtimestamp(value, tz=timezone.utc)
-    text = str(value).strip()
-    if not text:
-        return None
+def api_get_json(
+    session: requests.Session,
+    url: str,
+    params: dict[str, Any] | None = None,
+    timeout: int = 120,
+) -> tuple[int, Any, str]:
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+        r = session.get(url, params=params, timeout=timeout)
+        try:
+            return r.status_code, r.json(), r.text
+        except Exception:
+            return r.status_code, None, r.text
+    except Exception as e:
+        return 0, None, str(e)
 
 
-def policy_age_days(policy: dict[str, Any]) -> int | None:
-    dt = parse_last_modified(policy.get("lastModified") or policy.get("modifiedTime") or policy.get("updateTime"))
-    if not dt:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (now_utc() - dt).days
+def analyze_vmware_targets(session: requests.Session, host: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    print("\n-- VMware vCenter Targets ---------------------------")
+    status, data, text = api_get_json(session, f"{host}/api/v3/targets")
+    if status != 200:
+        print(f"  Unable to retrieve targets: HTTP {status}")
+        print(f"  Response: {short_text(text)}")
+        return [], []
 
+    targets = unwrap_collection(data)
+    vmware_targets = [t for t in targets if isinstance(t, dict) and is_vmware_target(t)]
+    print(f"  Total VMware targets: {len(vmware_targets)}")
 
-# -----------------------------------------------------------------------------
-# Settings flattening and default comparison
-# -----------------------------------------------------------------------------
-
-
-def flatten_policy_settings(policy: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """
-    Best-effort extraction of policy settings.
-
-    Turbonomic SettingsPolicyApiDTOs can contain settingsManagers with nested
-    settings. This function intentionally walks the structure generically so it
-    works across versions.
-    """
-    flattened: dict[str, dict[str, Any]] = {}
-    managers = policy.get("settingsManagers") or policy.get("settingManagers") or []
-    if not isinstance(managers, list):
-        managers = []
-
-    def walk(obj: Any, path: str, manager_name: str, manager_uuid: str) -> None:
-        if isinstance(obj, dict):
-            setting_uuid = normalize_string(
-                obj.get("uuid")
-                or obj.get("id")
-                or obj.get("name")
-                or obj.get("settingName")
-                or obj.get("displayName")
+    not_accepted: list[dict[str, Any]] = []
+    for target in vmware_targets:
+        status_value = str(target.get("status", "UNKNOWN"))
+        name = str(
+            target.get("displayName")
+            or get_target_field(target, "address")
+            or get_target_field(target, "nameOrAddress")
+            or target.get("uuid")
+            or "N/A"
+        )
+        if not status_is_accepted(status_value):
+            not_accepted.append(
+                {"name": name, "status": status_value, "uuid": target.get("uuid", "N/A")}
             )
-            has_value = any(k in obj for k in ("value", "valueType", "defaultValue"))
-            if setting_uuid and has_value:
-                value = obj.get("value")
-                display = normalize_string(obj.get("displayName") or obj.get("name") or setting_uuid)
-                key = f"{manager_uuid or manager_name}|{setting_uuid}"
-                flattened[key] = {
+            print(f"  WARNING: {name}: {status_value}")
+
+    if vmware_targets and not not_accepted:
+        print("  All VMware/vCenter targets are in an accepted state")
+    return vmware_targets, not_accepted
+
+def count_entities_by_search(
+    session: requests.Session,
+    host: str,
+    entity_type: str,
+    args: argparse.Namespace,
+    page_limit: int = 10000,
+) -> tuple[int, str]:
+    """
+    Count entities returned by /api/v3/search for a given entity type.
+
+    Important:
+    /api/v3/search?types=X&limit=1 does not return the total inventory count.
+    It only returns one matching element. Therefore, counting len(response)
+    with limit=1 is incorrect.
+
+    This function first tries a high limit and uses any explicit total/count
+    field if the API returns one. If the response is a list, it counts the
+    returned items. For environments larger than page_limit, increase
+    page_limit or add cursor-based pagination after validating the local
+    Swagger response shape.
+    """
+    status, data, text = api_get_json(
+        session,
+        f"{host}/api/v3/search",
+        params={"types": entity_type, "limit": page_limit},
+        timeout=180,
+    )
+
+    if status != 200:
+        return 0, f"HTTP {status}: {short_text(text, 200)}"
+
+    if isinstance(data, dict):
+        for key in ("count", "total", "totalCount", "total_count"):
+            if isinstance(data.get(key), int):
+                return int(data[key]), f"HTTP 200 total field={key}"
+
+        items = unwrap_collection(data)
+        count = len(items)
+
+        # Best-effort cursor visibility for troubleshooting
+        cursor = (
+            data.get("cursor")
+            or data.get("nextCursor")
+            or data.get("next_cursor")
+            or data.get("next")
+        )
+        if cursor:
+            return count, f"HTTP 200 partial page count={count}, cursor present"
+
+        return count, f"HTTP 200 dict collection count={count}"
+
+    if isinstance(data, list):
+        count = len(data)
+        if count >= page_limit:
+            return count, f"HTTP 200 list count={count}, may be truncated by limit={page_limit}"
+        return count, "HTTP 200 list"
+
+    return 0, f"HTTP 200 unexpected response type={type(data).__name__}"
+
+
+def get_vmware_entity_counts(session: requests.Session, host: str, args: argparse.Namespace) -> dict[str, int]:
+    print("\n-- VMware Entity Inventory --------------------------")
+    counts: dict[str, int] = {}
+
+    for entity_type in VMWARE_ENTITY_TYPES:
+        count, detail = count_entities_by_search(
+            session=session,
+            host=host,
+            entity_type=entity_type,
+            args=args,
+            page_limit=20000,
+        )
+        counts[entity_type] = count
+        vprint(args, f"  {entity_type}: {count} ({detail})")
+
+    print(f"  Total VMware entities: {sum(counts.values())}")
+    return counts
+
+
+    print("\n-- VMware Entity Inventory --------------------------")
+    counts: dict[str, int] = {}
+    for entity_type in VMWARE_ENTITY_TYPES:
+        status, data, _ = api_get_json(
+            session,
+            f"{host}/api/v3/search",
+            params={"types": entity_type, "limit": 1},
+            timeout=120,
+        )
+        count = 0
+        if status == 200:
+            if isinstance(data, dict):
+                for k in ("count", "total", "totalCount"):
+                    if isinstance(data.get(k), int):
+                        count = int(data[k])
+                        break
+                else:
+                    count = len(unwrap_collection(data))
+            elif isinstance(data, list):
+                count = len(data)
+        counts[entity_type] = count
+        vprint(args, f"  {entity_type}: {count} (HTTP {status})")
+    print(f"  Total VMware entities: {sum(counts.values())}")
+    return counts
+
+
+def fetch_settings_policies(session: requests.Session, host: str, args: argparse.Namespace) -> tuple[list[dict[str, Any]], int, str]:
+    print("\n-- Automation / Settings Policies -------------------")
+    status, data, text = api_get_json(session, f"{host}/api/v3/settingspolicies")
+    if status != 200:
+        print(f"  Unable to retrieve settings policies: HTTP {status}")
+        print(f"  Response: {short_text(text)}")
+        return [], status, text
+    policies = [p for p in unwrap_collection(data) if isinstance(p, dict)]
+    vmware_count = sum(1 for p in policies if is_vmware_entity_type(get_entity_type(p)))
+    print(f"  Total settings policies: {len(policies)}")
+    print(f"  VMware-specific: {vmware_count}")
+    return policies, status, text
+
+
+def fetch_default_settings_policies(session: requests.Session, host: str) -> tuple[list[dict[str, Any]], int, str]:
+    print("\n-- Default Automation Policies ----------------------")
+    status, data, text = api_get_json(
+        session,
+        f"{host}/api/v3/settingspolicies",
+        params={"only_defaults": "true"},
+    )
+    if status != 200:
+        print(f"  Unable to retrieve default settings policies: HTTP {status}")
+        print(f"  Response: {short_text(text)}")
+        return [], status, text
+    defaults = [p for p in unwrap_collection(data) if isinstance(p, dict)]
+    print(f"  Default settings policies: {len(defaults)}")
+    return defaults, status, text
+
+
+def fetch_policy_endpoint(session: requests.Session, host: str) -> tuple[list[dict[str, Any]], int, str]:
+    print("\n-- Placement / Policy Endpoint ----------------------")
+    status, data, text = api_get_json(session, f"{host}/api/v3/policies")
+    if status != 200:
+        print(f"  Unable to retrieve /policies endpoint: HTTP {status}")
+        print(f"  Response: {short_text(text)}")
+        return [], status, text
+    policies = [p for p in unwrap_collection(data) if isinstance(p, dict)]
+    vmware_count = sum(1 for p in policies if is_vmware_entity_type(get_entity_type(p)))
+    print(f"  Total policies: {len(policies)}")
+    print(f"  VMware-specific by entityType: {vmware_count}")
+    print(f"  Other entity types: {len(policies) - vmware_count}")
+    return policies, status, text
+
+
+def flatten_settings(obj: Any, path: str = "") -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if isinstance(obj, dict):
+        has_value = "value" in obj
+        has_identity = any(k in obj for k in ("uuid", "name", "displayName", "settingType", "type"))
+        if has_value and has_identity:
+            key = str(
+                get_first(
+                    obj,
+                    ["uuid", "name", "displayName", "settingType", "type"],
+                    path or "setting",
+                )
+            )
+            rows.append(
+                {
                     "key": key,
-                    "manager": manager_name,
-                    "manager_uuid": manager_uuid,
-                    "setting_uuid": setting_uuid,
-                    "display_name": display,
-                    "value": value,
-                    "value_type": obj.get("valueType"),
-                    "default_value": obj.get("defaultValue"),
                     "path": path,
+                    "name": str(get_first(obj, ["displayName", "name", "settingType", "type"], key)),
+                    "value": obj.get("value"),
+                    "defaultValue": obj.get("defaultValue"),
+                    "raw": obj,
                 }
-
-            for k, v in obj.items():
-                if k in {"links"}:
-                    continue
-                walk(v, f"{path}.{k}" if path else k, manager_name, manager_uuid)
-        elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                walk(item, f"{path}[{idx}]", manager_name, manager_uuid)
-
-    for index, manager in enumerate(managers):
-        if not isinstance(manager, dict):
-            continue
-        manager_name = normalize_string(manager.get("displayName") or manager.get("name") or f"manager_{index}")
-        manager_uuid = normalize_string(manager.get("uuid") or manager.get("id") or manager_name)
-        walk(manager, f"settingsManagers[{index}]", manager_name, manager_uuid)
-
-    return flattened
+            )
+        for k, v in obj.items():
+            if k in {"links", "href"}:
+                continue
+            next_path = f"{path}.{k}" if path else str(k)
+            rows.extend(flatten_settings(v, next_path))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            next_path = f"{path}[{i}]" if path else f"[{i}]"
+            rows.extend(flatten_settings(v, next_path))
+    return rows
 
 
-def build_default_policy_maps(default_policies: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, dict[str, Any]]], set[str]]:
-    default_by_entity: dict[str, dict[str, Any]] = {}
-    default_settings_by_entity: dict[str, dict[str, dict[str, Any]]] = {}
-    default_ids: set[str] = set()
-
-    for policy in default_policies:
-        pid = policy_id(policy)
-        etype = policy_entity_type(policy)
-        if pid:
-            default_ids.add(pid)
-        if etype and etype not in default_by_entity:
-            default_by_entity[etype] = policy
-            default_settings_by_entity[etype] = flatten_policy_settings(policy)
-
-    return default_by_entity, default_settings_by_entity, default_ids
+def build_default_setting_index(defaults: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = defaultdict(dict)
+    for p in defaults:
+        etype = get_entity_type(p)
+        for s in flatten_settings(p):
+            index[etype][s["key"]] = s.get("value")
+    return index
 
 
-def compare_to_default(
-    policy: dict[str, Any],
-    default_settings_by_entity: dict[str, dict[str, dict[str, Any]]],
-) -> dict[str, Any]:
-    etype = policy_entity_type(policy)
-    settings = flatten_policy_settings(policy)
-    default_settings = default_settings_by_entity.get(etype)
-
-    if not settings:
-        return {
-            "status": "NO_SETTINGS",
-            "changed_count": 0,
-            "total_settings": 0,
-            "changed_keys": [],
-        }
-
-    if not default_settings:
-        return {
-            "status": "NO_DEFAULT_AVAILABLE",
-            "changed_count": None,
-            "total_settings": len(settings),
-            "changed_keys": [],
-        }
-
-    changed_keys = []
-    for key, setting in settings.items():
-        default_setting = default_settings.get(key)
-        if not default_setting:
-            changed_keys.append(key)
-            continue
-        if setting.get("value") != default_setting.get("value"):
-            changed_keys.append(key)
-
-    return {
-        "status": "COMPARED",
-        "changed_count": len(changed_keys),
-        "total_settings": len(settings),
-        "changed_keys": changed_keys[:25],
-    }
+def count_setting_differences(policy: dict[str, Any], default_index: dict[str, dict[str, Any]]) -> tuple[int, int]:
+    etype = get_entity_type(policy)
+    defaults = default_index.get(etype, {})
+    if not defaults:
+        return 0, 0
+    compared = 0
+    diffs = 0
+    for s in flatten_settings(policy):
+        key = s["key"]
+        if key in defaults:
+            compared += 1
+            if str(s.get("value")) != str(defaults.get(key)):
+                diffs += 1
+    return diffs, compared
 
 
-def extract_action_modes(policy: dict[str, Any]) -> list[dict[str, Any]]:
-    modes = []
-    settings = flatten_policy_settings(policy)
-    for item in settings.values():
-        value = normalize_string(item.get("value")).upper()
-        if value in ACTION_MODE_VALUES:
+def extract_action_modes(policy: dict[str, Any], default_index: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    etype = get_entity_type(policy)
+    defaults = default_index.get(etype, {})
+    modes: list[dict[str, Any]] = []
+    for s in flatten_settings(policy):
+        value = s.get("value")
+        value_str = str(value).upper() if value is not None else ""
+        if value_str in ACTION_MODE_VALUES:
+            default_value = defaults.get(s["key"], s.get("defaultValue"))
             modes.append(
                 {
-                    "policy_id": policy_id(policy),
-                    "policy_name": policy_name(policy),
-                    "entity_type": policy_entity_type(policy),
-                    "manager": item.get("manager"),
-                    "setting_uuid": item.get("setting_uuid"),
-                    "setting_name": item.get("display_name"),
-                    "value": value,
-                    "risk": ACTION_MODE_RISK.get(value, "UNKNOWN"),
+                    "policy_id": get_policy_id(policy),
+                    "policy_name": get_policy_name(policy),
+                    "entityType": etype,
+                    "setting_key": s["key"],
+                    "setting_name": s["name"],
+                    "path": s["path"],
+                    "value": value_str,
+                    "default_value": default_value,
+                    "risk": action_mode_risk(value_str),
                 }
             )
     return modes
 
 
-# -----------------------------------------------------------------------------
-# Scope and group validation
-# -----------------------------------------------------------------------------
+def action_mode_risk(value: str) -> str:
+    v = str(value).upper()
+    if v == "AUTOMATIC":
+        return "High impact - automatic execution"
+    if v == "EXTERNAL_APPROVAL":
+        return "Workflow/integration dependency"
+    if v == "MANUAL":
+        return "Controlled manual execution"
+    if v == "RECOMMEND":
+        return "Recommendation only"
+    if v == "DISABLED":
+        return "Disabled action"
+    return "Unknown"
 
 
-def extract_member_count(group: dict[str, Any]) -> int | None:
+def get_group_member_count(group: dict[str, Any]) -> Any:
     for key in (
         "memberCount",
         "membersCount",
-        "numMembers",
-        "entitiesCount",
         "entityCount",
+        "entitiesCount",
         "count",
+        "totalCount",
     ):
         value = group.get(key)
         if isinstance(value, int):
             return value
+    members = group.get("members") or group.get("entities")
+    if isinstance(members, list):
+        return len(members)
     return None
 
 
-def fetch_group(session: requests.Session, group_uuid: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def get_group_info(
+    session: requests.Session,
+    host: str,
+    group_uuid: str,
+    cache: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not group_uuid:
+        return {"uuid": "", "status": "no uuid", "exists": False, "member_count": None}
     if group_uuid in cache:
         return cache[group_uuid]
 
-    result = {
-        "uuid": group_uuid,
-        "resolved": False,
-        "status_code": None,
-        "display_name": "",
-        "group_type": "",
-        "class_name": "",
-        "member_count": None,
-        "error": "",
-    }
-
-    if SKIP_GROUP_CHECK:
-        result["error"] = "group check skipped"
-        cache[group_uuid] = result
-        return result
-
-    try:
-        response = api_get(session, f"/api/v3/groups/{group_uuid}")
-        result["status_code"] = response.status_code
-        if response.status_code == 200:
-            payload = response.json()
-            if isinstance(payload, dict):
-                result.update(
-                    {
-                        "resolved": True,
-                        "display_name": normalize_string(payload.get("displayName") or payload.get("name")),
-                        "group_type": normalize_string(payload.get("groupType") or payload.get("entityType")),
-                        "class_name": normalize_string(payload.get("className") or payload.get("groupClassName")),
-                        "member_count": extract_member_count(payload),
-                    }
-                )
-        else:
-            result["error"] = response.text[:300]
-    except Exception as exc:  # noqa: BLE001 - best-effort diagnostic
-        result["error"] = str(exc)
-
-    cache[group_uuid] = result
-    return result
+    status, data, text = api_get_json(session, f"{host}/api/v3/groups/{group_uuid}")
+    if status == 200 and isinstance(data, dict):
+        info = {
+            "uuid": group_uuid,
+            "status": "ok",
+            "exists": True,
+            "name": get_first(data, ["displayName", "name"], group_uuid),
+            "groupType": get_first(data, ["groupType", "type", "entityType"], ""),
+            "member_count": get_group_member_count(data),
+        }
+    else:
+        info = {
+            "uuid": group_uuid,
+            "status": f"HTTP {status}",
+            "exists": False,
+            "name": "",
+            "groupType": "",
+            "member_count": None,
+            "response": short_text(text, 300),
+        }
+    cache[group_uuid] = info
+    return info
 
 
 def analyze_scopes(
     session: requests.Session,
+    host: str,
     policy: dict[str, Any],
-    default_policy: bool,
+    source: str,
+    skip_group_check: bool,
     group_cache: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    refs = policy_scopes(policy)
-    ids = scope_ids(policy)
-
-    if not refs:
-        if default_policy:
-            return {
-                "scope_health": "DEFAULT_OR_GLOBAL",
-                "scope_count": 0,
-                "resolved_count": 0,
-                "empty_group_count": 0,
-                "unresolved_count": 0,
-                "scope_details": [],
-            }
-        return {
-            "scope_health": "EMPTY",
-            "scope_count": 0,
-            "resolved_count": 0,
-            "empty_group_count": 0,
-            "unresolved_count": 0,
-            "scope_details": [],
-        }
-
-    details = []
-    resolved = 0
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    scopes = get_scopes(policy)
+    rows: list[dict[str, Any]] = []
     unresolved = 0
     empty_groups = 0
-
-    for ref in refs:
-        gid = extract_ref_uuid(ref)
-        ref_name = extract_ref_name(ref)
-        if not gid:
-            unresolved += 1
-            details.append(
-                {
-                    "uuid": "",
-                    "name": ref_name,
-                    "resolved": False,
-                    "member_count": None,
-                    "health": "UNRESOLVED",
-                    "error": "scope reference has no uuid/id",
-                }
-            )
-            continue
-
-        group = fetch_group(session, gid, group_cache)
-        if group.get("resolved"):
-            resolved += 1
-            member_count = group.get("member_count")
-            if member_count == 0:
+    checked = 0
+    for scope in scopes:
+        uuid = get_scope_uuid(scope)
+        name = get_scope_name(scope)
+        info = {
+            "uuid": uuid,
+            "name": name,
+            "exists": None,
+            "member_count": None,
+            "groupType": "",
+            "status": "not checked",
+        }
+        if not skip_group_check and uuid:
+            checked += 1
+            info = get_group_info(session, host, uuid, group_cache)
+            if not info.get("exists"):
+                unresolved += 1
+            elif info.get("member_count") == 0:
                 empty_groups += 1
-            details.append(
-                {
-                    "uuid": gid,
-                    "name": group.get("display_name") or ref_name,
-                    "resolved": True,
-                    "member_count": member_count,
-                    "group_type": group.get("group_type"),
-                    "class_name": group.get("class_name"),
-                    "health": "EMPTY_GROUP" if member_count == 0 else "OK",
-                    "error": "",
-                }
-            )
-        else:
-            unresolved += 1
-            details.append(
-                {
-                    "uuid": gid,
-                    "name": ref_name,
-                    "resolved": False,
-                    "member_count": None,
-                    "health": "UNRESOLVED",
-                    "error": group.get("error") or f"HTTP {group.get('status_code')}",
-                }
-            )
-
-    if unresolved == len(refs):
-        health = "UNRESOLVED"
-    elif empty_groups > 0:
-        health = "EMPTY_GROUP"
-    elif unresolved > 0:
-        health = "PARTIAL"
-    else:
-        health = "OK"
-
-    return {
-        "scope_health": health,
-        "scope_count": len(refs),
-        "resolved_count": resolved,
-        "empty_group_count": empty_groups,
-        "unresolved_count": unresolved,
-        "scope_details": details,
-        "scope_ids": ids,
-    }
+        rows.append(
+            {
+                "policy_id": get_policy_id(policy),
+                "policy_name": get_policy_name(policy),
+                "source": source,
+                "entityType": get_entity_type(policy),
+                "scope_uuid": uuid,
+                "scope_name": name or info.get("name", ""),
+                "exists": info.get("exists"),
+                "member_count": info.get("member_count"),
+                "groupType": info.get("groupType", ""),
+                "status": info.get("status", ""),
+            }
+        )
+    return rows, checked, unresolved, empty_groups
 
 
-# -----------------------------------------------------------------------------
-# API collection
-# -----------------------------------------------------------------------------
-
-
-def login() -> requests.Session:
-    session = requests.Session()
-    session.verify = False
-    session.trust_env = bool(args.trust_env_proxy)
-
-    print(f"\nConnecting to {TURBO_HOST} ...")
-    response = api_post(
-        session,
-        "/api/v3/login",
-        data={"username": USERNAME, "password": PASSWORD},
-    )
-    if response.status_code != 200:
-        print(f"Authentication failed: HTTP {response.status_code}")
-        if response.text:
-            print(response.text[:500])
-        raise SystemExit(1)
-
-    print("Authentication successful")
-    return session
-
-
-def analyze_vmware_targets(session: requests.Session) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    print("\n-- VMware vCenter Targets ---------------------------")
-    try:
-        response = api_get(session, "/api/v3/targets")
-        if response.status_code != 200:
-            print_api_warning("targets", response)
-            return [], []
-
-        targets = unwrap_list_response(response.json())
-        vmware_targets = [t for t in targets if isinstance(t, dict) and is_vmware_target(t)]
-        print(f"  Total VMware targets: {len(vmware_targets)}")
-
-        disconnected = []
-        for target in vmware_targets:
-            status = target.get("status", "UNKNOWN")
-            name = normalize_string(
-                target.get("displayName")
-                or target.get("name")
-                or get_target_field(target, "address")
-                or target.get("uuid")
-                or "N/A"
-            )
-            if is_target_ok(status):
-                debug(f"  OK: {name}: {status}")
-            else:
-                disconnected.append({"name": name, "status": status, "uuid": target.get("uuid")})
-                print(f"  WARNING: {name}: {status}")
-
-        if vmware_targets and not disconnected:
-            print("  All VMware/vCenter targets are in an accepted state")
-
-        return vmware_targets, disconnected
-    except Exception as exc:  # noqa: BLE001 - diagnostic script
-        print(f"  Error analyzing VMware targets: {exc}")
-        return [], []
-
-
-def get_vmware_entity_counts(session: requests.Session) -> dict[str, int | str]:
-    print("\n-- VMware Entity Inventory --------------------------")
-    entity_counts: dict[str, int | str] = {}
-
-    for entity_type in VMWARE_ENTITY_TYPES:
-        try:
-            response = api_get(
-                session,
-                "/api/v3/search",
-                params={"types": entity_type, "limit": 1},
-            )
-            if response.status_code == 200:
-                payload = response.json()
-                if isinstance(payload, dict) and isinstance(payload.get("count"), int):
-                    count: int | str = payload["count"]
-                else:
-                    # Some versions return only the page; with limit=1 this is an
-                    # availability indicator rather than a true total.
-                    count = len(unwrap_list_response(payload))
-                entity_counts[entity_type] = count
-                debug(f"  {entity_type}: {count}")
-            else:
-                entity_counts[entity_type] = "N/A"
-                debug(f"  {entity_type}: HTTP {response.status_code}")
-        except Exception as exc:  # noqa: BLE001
-            entity_counts[entity_type] = "N/A"
-            debug(f"  {entity_type}: {exc}")
-
-    numeric_total = sum(v for v in entity_counts.values() if isinstance(v, int))
-    print(f"  Total VMware entities: {numeric_total}")
-    return entity_counts
-
-
-def collect_audit_log(session: requests.Session, cutoff_ms: int) -> tuple[bool, set[str], int, str]:
-    print(f"\n-- Audit Log (last {INACTIVITY_DAYS} days) --------------------------")
-    policy_ids_in_audit: set[str] = set()
-    audit_count = 0
-    note = ""
-
-    try:
-        offset = 0
-        limit = 500
-        while True:
-            response = api_get(
-                session,
-                "/api/v3/audit",
-                params={"starttime": cutoff_ms, "limit": limit, "offset": offset},
-            )
-            if response.status_code != 200:
-                note = f"unavailable: HTTP {response.status_code}"
-                print(f"  Audit log unavailable: {response.status_code}")
-                return False, policy_ids_in_audit, audit_count, note
-
-            entries = unwrap_list_response(response.json())
-            if not entries:
-                break
-
-            audit_count += len(entries)
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                for key in ("targetId", "policyId", "uuid", "entityUuid"):
-                    value = entry.get(key)
-                    if value:
-                        policy_ids_in_audit.add(str(value))
-
-            if len(entries) < limit:
-                break
-            offset += limit
-
-        print(f"  Audit entries retrieved: {audit_count}")
-        print(f"  Policies/entities with activity: {len(policy_ids_in_audit)}")
-        return True, policy_ids_in_audit, audit_count, "available"
-    except Exception as exc:  # noqa: BLE001
-        note = f"error: {exc}"
-        print(f"  Audit log error: {exc}")
-        return False, policy_ids_in_audit, audit_count, note
-
-
-def get_recent_policy_action_status(
+def check_recent_actions(
     session: requests.Session,
-    pid: str,
-    cutoff_ms: int,
+    host: str,
+    policy_id: str,
+    days: int,
     cache: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """
-    Best-effort check. Some Turbonomic versions may not support policyId on
-    /actions. A failed call is recorded as N/A and is not used as stale evidence.
-    """
-    if SKIP_ACTION_CHECK:
-        return {"available": False, "has_recent_actions": None, "status_code": None, "note": "skipped"}
-    if not pid:
-        return {"available": False, "has_recent_actions": None, "status_code": None, "note": "no policy id"}
-    if pid in cache:
-        return cache[pid]
+    if not policy_id:
+        return {"available": False, "count": None, "status": "no policy id"}
+    if policy_id in cache:
+        return cache[policy_id]
 
-    result = {"available": False, "has_recent_actions": None, "status_code": None, "note": ""}
-    try:
-        response = api_get(
-            session,
-            "/api/v3/actions",
-            params={"policyId": pid, "starttime": cutoff_ms, "limit": 1},
-        )
-        result["status_code"] = response.status_code
-        if response.status_code == 200:
-            payload = response.json()
-            entries = unwrap_list_response(payload)
-            result["available"] = True
-            result["has_recent_actions"] = bool(entries)
-            result["note"] = "available"
-        else:
-            result["note"] = f"HTTP {response.status_code}"
-    except Exception as exc:  # noqa: BLE001
-        result["note"] = f"error: {exc}"
-
-    cache[pid] = result
+    cutoff_ms = int((now_utc().timestamp() - days * 86400) * 1000)
+    status, data, text = api_get_json(
+        session,
+        f"{host}/api/v3/actions",
+        params={"policyId": policy_id, "starttime": cutoff_ms, "limit": 1},
+        timeout=60,
+    )
+    if status == 200:
+        items = unwrap_collection(data)
+        result = {"available": True, "count": len(items), "status": "ok"}
+    else:
+        result = {
+            "available": False,
+            "count": None,
+            "status": f"HTTP {status}",
+            "response": short_text(text, 300),
+        }
+    cache[policy_id] = result
     return result
 
 
-def collect_settings_policies(session: requests.Session) -> tuple[list[dict[str, Any]], str]:
-    print("\n-- Automation / Settings Policies -------------------")
-    response = api_get(session, "/api/v3/settingspolicies")
-    if response.status_code == 200:
-        policies = [p for p in unwrap_list_response(response.json()) if isinstance(p, dict)]
-        print(f"  Total settings policies: {len(policies)}")
-        vmware_count = sum(1 for p in policies if policy_entity_type(p) in VMWARE_ENTITY_TYPES)
-        print(f"  VMware-specific: {vmware_count}")
-        return policies, "available"
-
-    print_api_warning("settings policies", response)
-    return [], f"HTTP {response.status_code}"
+def safe_decode(raw: bytes) -> str:
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
-def collect_default_settings_policies(session: requests.Session) -> tuple[list[dict[str, Any]], str]:
-    print("\n-- Default Automation Policies ----------------------")
-    response = api_get(session, "/api/v3/settingspolicies", params={"only_defaults": "true"})
-    if response.status_code == 200:
-        policies = [p for p in unwrap_list_response(response.json()) if isinstance(p, dict)]
-        print(f"  Default settings policies: {len(policies)}")
-        return policies, "available"
-
-    print_api_warning("default settings policies", response)
-    return [], f"HTTP {response.status_code}"
+def content_disposition_filename(headers: dict[str, str]) -> str | None:
+    cd = headers.get("content-disposition") or headers.get("Content-Disposition")
+    if not cd:
+        return None
+    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd)
+    if m:
+        return Path(m.group(1)).name
+    return None
 
 
-def collect_placement_policies(session: requests.Session) -> tuple[list[dict[str, Any]], str]:
-    print("\n-- Placement / Policy Endpoint ----------------------")
-    response = api_get(session, "/api/v3/policies")
-    if response.status_code == 200:
-        policies = [p for p in unwrap_list_response(response.json()) if isinstance(p, dict)]
-        print(f"  Total policies: {len(policies)}")
-        vmware_count = sum(1 for p in policies if policy_entity_type(p) in VMWARE_ENTITY_TYPES)
-        print(f"  VMware-specific by entityType: {vmware_count}")
-        print(f"  Other entity types: {len(policies) - vmware_count}")
-        return policies, "available"
+def fetch_admin_auditlogs(
+    session: requests.Session,
+    host: str,
+    days: int,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    print("\n-- Admin Audit Logs ---------------------------------")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Any] = {
+        "requested": True,
+        "available": False,
+        "status_code": None,
+        "message": "not attempted",
+        "path": "",
+        "sha256": "",
+        "files": [],
+    }
+    try:
+        r = session.get(
+            f"{host}/api/v3/admin/auditlogs",
+            params={"days": days},
+            headers={"Accept": "application/gzip"},
+            timeout=300,
+        )
+    except Exception as e:
+        result["message"] = str(e)
+        print(f"  Unable to download admin audit logs: {e}")
+        return result
 
-    print_api_warning("placement/policy endpoint", response)
-    return [], f"HTTP {response.status_code}"
+    result["status_code"] = r.status_code
+    if r.status_code != 200:
+        result["message"] = f"HTTP {r.status_code}: {short_text(r.text, 500)}"
+        if r.status_code == 403:
+            print("  Admin audit logs unavailable: HTTP 403 Access denied")
+            print("  A user with Administrator or Site Administrator privileges is normally required.")
+        else:
+            print(f"  Admin audit logs unavailable: HTTP {r.status_code}")
+            print(f"  Response: {short_text(r.text, 500)}")
+        return result
+
+    filename = content_disposition_filename(r.headers) or f"turbo_auditlogs_{days}d_{now_stamp()}.tar.gz"
+    path = artifact_dir / filename
+    path.write_bytes(r.content)
+    result["available"] = True
+    result["message"] = "downloaded"
+    result["path"] = str(path)
+    result["sha256"] = sha256_file(path)
+    print(f"  Admin audit logs downloaded: {path}")
+    print(f"  SHA256: {result['sha256']}")
+
+    result["files"] = extract_audit_text_files(path)
+    print(f"  Parsed audit text files: {len(result['files'])}")
+    return result
 
 
-# -----------------------------------------------------------------------------
-# Classification and analysis
-# -----------------------------------------------------------------------------
+def extract_audit_text_files(path: Path, max_file_bytes: int = 20 * 1024 * 1024, max_total_bytes: int = 250 * 1024 * 1024) -> list[dict[str, str]]:
+    files: list[dict[str, str]] = []
+    total = 0
+
+    def add_file(name: str, raw: bytes) -> None:
+        nonlocal total
+        if total >= max_total_bytes:
+            return
+        if len(raw) > max_file_bytes:
+            raw = raw[:max_file_bytes]
+        total += len(raw)
+        text = safe_decode(raw)
+        files.append({"name": name, "text": text})
+
+    # tar.gz or tar
+    try:
+        with tarfile.open(path, "r:*") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                fh = tf.extractfile(member)
+                if not fh:
+                    continue
+                add_file(member.name, fh.read(max_file_bytes + 1))
+                if total >= max_total_bytes:
+                    break
+            return files
+    except tarfile.TarError:
+        pass
+
+    # zip
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as zf:
+                for name in zf.namelist():
+                    if name.endswith("/"):
+                        continue
+                    with zf.open(name) as fh:
+                        add_file(name, fh.read(max_file_bytes + 1))
+                    if total >= max_total_bytes:
+                        break
+            return files
+    except Exception:
+        pass
+
+    # single gzip
+    try:
+        with gzip.open(path, "rb") as gf:
+            add_file(path.name.replace(".gz", ""), gf.read(max_file_bytes + 1))
+            return files
+    except Exception:
+        pass
+
+    # raw text/binary fallback
+    try:
+        add_file(path.name, path.read_bytes()[: max_file_bytes + 1])
+    except Exception:
+        pass
+    return files
+
+
+def build_audit_matches(
+    policies: list[dict[str, Any]],
+    audit_result: dict[str, Any],
+    max_matches_per_policy: int,
+) -> dict[str, list[dict[str, str]]]:
+    matches: dict[str, list[dict[str, str]]] = defaultdict(list)
+    if not audit_result.get("available"):
+        return matches
+
+    token_map: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for p in policies:
+        pid = get_policy_id(p)
+        name = get_policy_name(p)
+        if pid:
+            token_map[pid.lower()].append((pid, "uuid"))
+        clean_name = name.strip()
+        if len(clean_name) >= 6 and clean_name.lower() not in GENERIC_NAMES_TO_IGNORE_FOR_AUDIT:
+            token_map[clean_name.lower()].append((pid, "name"))
+
+    if not token_map:
+        return matches
+
+    for file_item in audit_result.get("files", []):
+        fname = file_item.get("name", "")
+        text = file_item.get("text", "")
+        for line_no, line in enumerate(text.splitlines(), 1):
+            lower = line.lower()
+            for token, pid_kind_list in token_map.items():
+                if token and token in lower:
+                    for pid, kind in pid_kind_list:
+                        if len(matches[pid]) < max_matches_per_policy:
+                            matches[pid].append(
+                                {
+                                    "file": fname,
+                                    "line": str(line_no),
+                                    "match_type": kind,
+                                    "text": short_text(line.strip(), 500),
+                                }
+                            )
+                    break
+    return matches
 
 
 def classify_settings_policy(
     policy: dict[str, Any],
-    default_policy: bool,
-    enabled: bool,
-    scope_analysis: dict[str, Any],
-    default_compare: dict[str, Any],
+    default_ids: set[str],
+    scope_count: int,
+    unresolved_scopes: int,
+    empty_groups: int,
+    setting_diff_count: int,
+    setting_compare_count: int,
     action_modes: list[dict[str, Any]],
-    audit_available: bool,
-    in_audit: bool,
-    action_status: dict[str, Any],
-    conflict_count: int = 0,
+    audit_match_count: int,
+    actions_info: dict[str, Any] | None,
 ) -> tuple[str, str, list[str]]:
-    name = policy_name(policy)
+    name = get_policy_name(policy)
+    etype = get_entity_type(policy)
+    enabled = get_enabled(policy)
+    default_policy = is_default_policy(policy, default_ids)
+    vmware = is_vmware_entity_type(etype)
     reasons: list[str] = []
 
-    scope_health = scope_analysis.get("scope_health")
-    changed_count = default_compare.get("changed_count")
-    age = policy_age_days(policy)
-    recent_actions_available = bool(action_status.get("available"))
-    has_recent_actions = action_status.get("has_recent_actions")
-    high_action_modes = [m for m in action_modes if m.get("risk") == "HIGH"]
-
     if default_policy:
-        reasons.append("default policy")
-        return "KEEP", "Default automation/settings policy", reasons
-
+        reasons.append("default/system policy")
     if not enabled:
         reasons.append("disabled")
+    if scope_count == 0 and not default_policy:
+        reasons.append("empty scope")
+    if unresolved_scopes:
+        reasons.append(f"unresolved scopes: {unresolved_scopes}")
+    if empty_groups:
+        reasons.append(f"empty groups: {empty_groups}")
+    if setting_compare_count > 0 and setting_diff_count == 0 and not default_policy:
+        reasons.append("no differences from default")
+    if name_has_test_pattern(name):
+        reasons.append("test/demo/temp naming pattern")
+    if action_modes:
+        automatic = sum(1 for a in action_modes if a.get("value") == "AUTOMATIC")
+        disabled_modes = sum(1 for a in action_modes if a.get("value") == "DISABLED")
+        if automatic:
+            reasons.append(f"automatic action modes: {automatic}")
+        if disabled_modes:
+            reasons.append(f"disabled action modes: {disabled_modes}")
+    if audit_match_count:
+        reasons.append(f"audit log matches: {audit_match_count}")
+    if actions_info and actions_info.get("available") and actions_info.get("count"):
+        reasons.append("recent action evidence")
 
-    if scope_health in {"EMPTY", "UNRESOLVED", "EMPTY_GROUP", "PARTIAL"}:
-        reasons.append(f"scope health: {scope_health}")
+    if default_policy:
+        return "KEEP", "Default/system policy; do not delete from stale cleanup.", reasons
 
-    if default_compare.get("status") == "COMPARED":
-        if changed_count == 0:
-            reasons.append("no detected differences from default policy")
-        else:
-            reasons.append(f"{changed_count} setting(s) differ from default")
-    elif default_compare.get("status") == "NO_DEFAULT_AVAILABLE":
-        reasons.append("default comparison unavailable")
-
-    if audit_available:
-        if not in_audit:
-            reasons.append(f"not found in audit log in last {INACTIVITY_DAYS} days")
-    else:
-        reasons.append("audit log unavailable; not used as stale evidence")
-
-    if recent_actions_available:
-        if not has_recent_actions:
-            reasons.append(f"no recent actions found in last {INACTIVITY_DAYS} days")
-    else:
-        reasons.append("action check unavailable; not used as stale evidence")
-
-    if age is not None and age > 365:
-        reasons.append(f"last modified {age} days ago")
-
-    if high_action_modes:
-        reasons.append(f"{len(high_action_modes)} AUTOMATIC action mode setting(s)")
-
-    if conflict_count:
-        reasons.append(f"{conflict_count} conflicting setting(s) on same scope")
-
-    name_is_test = has_name_pattern(name, TEST_NAME_PATTERNS)
-    name_is_orphan = has_name_pattern(name, ORPHAN_PATTERNS)
-
-    # Conservative delete candidate: only when multiple strong indicators agree.
+    # Strong delete candidate only when several safe/stale signals are combined.
     if (
         not enabled
-        and scope_health in {"EMPTY", "UNRESOLVED", "EMPTY_GROUP"}
-        and (name_is_test or name_is_orphan or changed_count == 0)
+        and (scope_count == 0 or unresolved_scopes > 0 or empty_groups > 0)
+        and (name_has_test_pattern(name) or (setting_compare_count > 0 and setting_diff_count == 0))
+        and audit_match_count == 0
     ):
         return (
             "CANDIDATE_DELETE",
-            "Disabled non-default policy with empty/unresolved scope and weak/custom-test signal",
+            "Disabled non-default policy with empty/unresolved/empty scope and additional stale signal. Validate manually before deletion.",
             reasons,
         )
 
-    if not enabled:
-        return "REVIEW", "Disabled non-default policy; verify whether it is intentionally retained", reasons
+    if not vmware:
+        return "INFO", "Non-VMware entity type included for visibility; not part of VMware cleanup decision.", reasons
 
-    if scope_health in {"EMPTY", "UNRESOLVED", "EMPTY_GROUP", "PARTIAL"}:
-        return "REVIEW", "Scope is empty, unresolved, or partially resolved", reasons
+    if not enabled or scope_count == 0 or unresolved_scopes or empty_groups:
+        return "REVIEW", "Policy has scope/enabled signals that require manual validation.", reasons
 
-    if changed_count == 0 and default_compare.get("status") == "COMPARED":
-        return "REVIEW", "Custom policy appears identical to its default policy", reasons
+    if setting_compare_count > 0 and setting_diff_count == 0:
+        return "REVIEW", "Custom policy appears equivalent to default; validate whether it is redundant.", reasons
 
-    if conflict_count:
-        return "REVIEW", "Possible overlapping/conflicting policy settings on same scope", reasons
+    if action_modes:
+        return "REVIEW", "Policy contains action mode settings; review operational impact.", reasons
 
-    if high_action_modes:
-        return "REVIEW", "Policy contains AUTOMATIC action modes; validate operational intent", reasons
-
-    if age is not None and age > 365 and audit_available and not in_audit:
-        return "REVIEW", "Old policy with no audit activity in the checked period", reasons
-
-    return "KEEP", "No strong stale indicators detected", reasons
+    return "KEEP", "No strong stale indicators detected.", reasons
 
 
-def extract_group_ref_from_placement(policy: dict[str, Any], keys: tuple[str, ...]) -> Any:
-    for key in keys:
-        value = policy.get(key)
-        if value:
-            return value
-    return None
-
-
-def analyze_placement_policy(
-    session: requests.Session,
-    policy: dict[str, Any],
-    group_cache: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    enabled = policy_enabled(policy)
-    name = policy_name(policy)
-    pid = policy_id(policy)
-    etype = policy_entity_type(policy)
-
-    consumer_ref = extract_group_ref_from_placement(policy, ("consumerGroup", "consumerGroupUuid", "consumer"))
-    provider_ref = extract_group_ref_from_placement(policy, ("providerGroup", "providerGroupUuid", "provider"))
-    merge_groups = policy.get("mergeGroups") or []
-
-    group_refs = []
-    for label, ref in (("consumer", consumer_ref), ("provider", provider_ref)):
-        if ref:
-            group_refs.append((label, ref))
-    if isinstance(merge_groups, list):
-        for ref in merge_groups:
-            group_refs.append(("merge", ref))
-
-    group_details = []
-    unresolved = 0
-    empty = 0
-    for label, ref in group_refs:
-        gid = extract_ref_uuid(ref)
-        ref_name = extract_ref_name(ref)
-        if not gid:
-            unresolved += 1
-            group_details.append(f"{label}: unresolved ref {ref_name}")
-            continue
-        group = fetch_group(session, gid, group_cache)
-        if not group.get("resolved"):
-            unresolved += 1
-            group_details.append(f"{label}: unresolved {gid}")
-        else:
-            member_count = group.get("member_count")
-            if member_count == 0:
-                empty += 1
-            group_details.append(
-                f"{label}: {group.get('display_name') or gid} members={member_count if member_count is not None else 'N/A'}"
-            )
-
-    reasons = []
+def classify_placement_policy(policy: dict[str, Any], audit_match_count: int) -> tuple[str, str, list[str]]:
+    name = get_policy_name(policy)
+    etype = get_entity_type(policy)
+    enabled = get_enabled(policy)
+    reasons: list[str] = []
     if not enabled:
         reasons.append("disabled")
-    if not group_refs:
-        reasons.append("no consumer/provider/merge group references detected")
-    if unresolved:
-        reasons.append(f"{unresolved} unresolved group reference(s)")
-    if empty:
-        reasons.append(f"{empty} group reference(s) with zero members")
+    if name_has_test_pattern(name):
+        reasons.append("test/demo/temp naming pattern")
+    if audit_match_count:
+        reasons.append(f"audit log matches: {audit_match_count}")
 
-    if not enabled and (has_name_pattern(name, TEST_NAME_PATTERNS) or has_name_pattern(name, ORPHAN_PATTERNS)):
-        classification = "CANDIDATE_DELETE"
-        justification = "Disabled placement/policy entry with test/orphan-like name"
-    elif not enabled or unresolved or empty or not group_refs:
-        classification = "REVIEW"
-        justification = "Placement policy requires group/reference validation"
-    else:
-        classification = "INFO"
-        justification = "Placement/policy endpoint entry collected for inventory"
+    if is_vmware_entity_type(etype):
+        if not enabled or name_has_test_pattern(name):
+            return "REVIEW", "VMware-related placement/policy endpoint object requires manual review.", reasons
+        return "INFO", "VMware-related placement/policy endpoint object; analyze separately from automation settings.", reasons
 
+    return "INFO", "Placement/policy endpoint object with non-VMware or unknown entity type; included for inventory only.", reasons
+
+
+def make_policy_row(
+    policy: dict[str, Any],
+    source: str,
+    classification: str,
+    justification: str,
+    reasons: list[str],
+    default_ids: set[str],
+    setting_diff_count: int = 0,
+    setting_compare_count: int = 0,
+    action_mode_count: int = 0,
+    scope_count: int | None = None,
+    unresolved_scopes: int = 0,
+    empty_groups: int = 0,
+    audit_match_count: int = 0,
+    actions_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    etype = get_entity_type(policy)
+    scopes = get_scopes(policy)
+    if scope_count is None:
+        scope_count = len(scopes)
     return {
         "classification": classification,
-        "justification": justification,
-        "source": "placement_policy",
-        "id": pid,
-        "name": name,
-        "entity_type": etype,
-        "enabled": enabled,
-        "policy_type": normalize_string(policy.get("type") or policy.get("policyType")),
-        "consumer_group": extract_ref_name(consumer_ref),
-        "provider_group": extract_ref_name(provider_ref),
-        "merge_groups": len(merge_groups) if isinstance(merge_groups, list) else 0,
-        "unresolved_groups": unresolved,
-        "empty_groups": empty,
-        "group_details": "; ".join(group_details),
+        "source": source,
+        "vmware_specific": str(is_vmware_entity_type(etype)),
+        "name": get_policy_name(policy),
+        "entityType": etype,
+        "enabled": str(get_enabled(policy)),
+        "default_policy": str(is_default_policy(policy, default_ids)),
+        "scope_count": scope_count,
+        "unresolved_scopes": unresolved_scopes,
+        "empty_groups": empty_groups,
+        "settings_diff_count": setting_diff_count,
+        "settings_compared": setting_compare_count,
+        "action_mode_count": action_mode_count,
+        "audit_matches": audit_match_count,
+        "action_check": actions_info.get("status") if actions_info else "not checked",
         "reasons": "; ".join(reasons),
-        "raw_hash": json_hash(policy),
+        "justification": justification,
+        "last_modified": get_first(policy, ["lastModified", "modifiedTime", "updatedAt"], "N/A"),
+        "id": get_policy_id(policy),
     }
 
 
-def build_conflict_index(policy_analyses: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Detect same entityType + same exact scope set + same setting with different values."""
-    buckets: dict[tuple[str, tuple[str, ...], str], list[dict[str, Any]]] = defaultdict(list)
-
-    for analysis in policy_analyses:
-        policy = analysis["raw_policy"]
-        settings = flatten_policy_settings(policy)
-        scopes = tuple(scope_ids(policy))
-        etype = policy_entity_type(policy)
-        for key, setting in settings.items():
-            buckets[(etype, scopes, key)].append(
+def analyze_conflicts(settings_policies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    index: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for p in settings_policies:
+        etype = get_entity_type(p)
+        scopes = get_scopes(p)
+        scope_ids = sorted([get_scope_uuid(s) or get_scope_name(s) for s in scopes])
+        scope_key = ",".join(scope_ids) if scope_ids else "<empty-scope>"
+        for setting in flatten_settings(p):
+            key = (etype, scope_key, setting["key"])
+            index[key].append(
                 {
-                    "policy_id": policy_id(policy),
-                    "policy_name": policy_name(policy),
-                    "entity_type": etype,
-                    "scope_ids": scopes,
-                    "setting_key": key,
-                    "setting_name": setting.get("display_name"),
+                    "policy_id": get_policy_id(p),
+                    "policy_name": get_policy_name(p),
+                    "entityType": etype,
+                    "scope_key": scope_key,
+                    "setting_key": setting["key"],
+                    "setting_name": setting["name"],
                     "value": setting.get("value"),
                 }
             )
 
-    conflicts = []
-    conflict_counts: dict[str, int] = defaultdict(int)
-    for (etype, scopes, setting_key), rows in buckets.items():
-        if len(rows) < 2:
-            continue
+    conflicts: list[dict[str, Any]] = []
+    for (_etype, _scope, _setting), rows in index.items():
         values = {json.dumps(r.get("value"), sort_keys=True, default=str) for r in rows}
-        if len(values) <= 1:
-            continue
-        for row in rows:
-            conflict_counts[row["policy_id"]] += 1
-            conflicts.append(
-                {
-                    "entity_type": etype,
-                    "scope_ids": ",".join(scopes),
-                    "setting_key": setting_key,
-                    "setting_name": row.get("setting_name"),
-                    "policy_id": row.get("policy_id"),
-                    "policy_name": row.get("policy_name"),
-                    "value": json.dumps(row.get("value"), ensure_ascii=False, default=str),
-                }
-            )
-
-    return conflicts, conflict_counts
+        policy_ids = {r.get("policy_id") for r in rows}
+        if len(policy_ids) > 1 and len(values) > 1:
+            for r in rows:
+                r2 = dict(r)
+                r2["conflict_count"] = len(rows)
+                r2["distinct_values"] = len(values)
+                conflicts.append(r2)
+    return conflicts
 
 
-def analyze_settings_policies(
-    session: requests.Session,
-    policies: list[dict[str, Any]],
-    default_settings_by_entity: dict[str, dict[str, dict[str, Any]]],
-    default_ids: set[str],
-    audit_available: bool,
-    policy_ids_in_audit: set[str],
-    cutoff_ms: int,
-    group_cache: dict[str, dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    preliminary = []
-    action_mode_rows = []
-    scope_rows = []
-    action_cache: dict[str, dict[str, Any]] = {}
-
-    # First pass collects settings/scopes/action modes. Conflict detection needs
-    # all policies before final classification.
-    for i, policy in enumerate(policies):
-        pid = policy_id(policy)
-        default_policy = is_default_policy(policy, default_ids)
-        enabled = policy_enabled(policy)
-        scopes = analyze_scopes(session, policy, default_policy, group_cache)
-        default_compare = compare_to_default(policy, default_settings_by_entity)
-        modes = extract_action_modes(policy)
-        action_mode_rows.extend(modes)
-
-        for detail in scopes.get("scope_details", []) or []:
-            scope_rows.append(
-                {
-                    "policy_id": pid,
-                    "policy_name": policy_name(policy),
-                    "entity_type": policy_entity_type(policy),
-                    "scope_uuid": detail.get("uuid"),
-                    "scope_name": detail.get("name"),
-                    "resolved": detail.get("resolved"),
-                    "member_count": detail.get("member_count"),
-                    "group_type": detail.get("group_type"),
-                    "class_name": detail.get("class_name"),
-                    "health": detail.get("health"),
-                    "error": detail.get("error"),
-                }
-            )
-
-        preliminary.append(
-            {
-                "raw_policy": policy,
-                "default_policy": default_policy,
-                "enabled": enabled,
-                "scope_analysis": scopes,
-                "default_compare": default_compare,
-                "action_modes": modes,
-            }
-        )
-        debug(f"  [{i + 1}/{len(policies)}] {policy_name(policy)}")
-
-    conflicts, conflict_counts = build_conflict_index(preliminary)
-
-    results = []
-    for item in preliminary:
-        policy = item["raw_policy"]
-        pid = policy_id(policy)
-        action_status = get_recent_policy_action_status(session, pid, cutoff_ms, action_cache)
-        in_audit = pid in policy_ids_in_audit if pid else False
-        conflict_count = conflict_counts.get(pid, 0)
-        classification, justification, reasons = classify_settings_policy(
-            policy=policy,
-            default_policy=item["default_policy"],
-            enabled=item["enabled"],
-            scope_analysis=item["scope_analysis"],
-            default_compare=item["default_compare"],
-            action_modes=item["action_modes"],
-            audit_available=audit_available,
-            in_audit=in_audit,
-            action_status=action_status,
-            conflict_count=conflict_count,
-        )
-
-        changed_count = item["default_compare"].get("changed_count")
-        action_mode_summary = ", ".join(
-            sorted({f"{m['value']}({m['risk']})" for m in item["action_modes"]})
-        )
-
-        results.append(
-            {
-                "classification": classification,
-                "justification": justification,
-                "source": "settings_policy",
-                "id": pid,
-                "name": policy_name(policy),
-                "entity_type": policy_entity_type(policy),
-                "vmware_specific": policy_entity_type(policy) in VMWARE_ENTITY_TYPES,
-                "enabled": item["enabled"],
-                "is_default": item["default_policy"],
-                "scope_count": item["scope_analysis"].get("scope_count", 0),
-                "scope_health": item["scope_analysis"].get("scope_health"),
-                "resolved_scopes": item["scope_analysis"].get("resolved_count", 0),
-                "unresolved_scopes": item["scope_analysis"].get("unresolved_count", 0),
-                "empty_scope_groups": item["scope_analysis"].get("empty_group_count", 0),
-                "default_compare_status": item["default_compare"].get("status"),
-                "changed_settings": changed_count if changed_count is not None else "N/A",
-                "total_settings": item["default_compare"].get("total_settings"),
-                "action_modes": action_mode_summary,
-                "conflict_count": conflict_count,
-                "audit_check": "FOUND" if audit_available and in_audit else ("NOT_FOUND" if audit_available else "N/A"),
-                "actions_check": (
-                    "HAS_RECENT_ACTIONS"
-                    if action_status.get("available") and action_status.get("has_recent_actions")
-                    else ("NO_RECENT_ACTIONS" if action_status.get("available") else "N/A")
-                ),
-                "actions_note": action_status.get("note"),
-                "last_modified": policy.get("lastModified") or policy.get("modifiedTime") or "N/A",
-                "age_days": policy_age_days(policy),
-                "reasons": "; ".join(reasons),
-                "raw_hash": json_hash(policy),
-                "snapshot_scope_ids": scope_ids(policy),
-                "snapshot_settings_hash": json_hash(flatten_policy_settings(policy)),
-            }
-        )
-
-    return results, action_mode_rows, scope_rows, conflicts
-
-
-# -----------------------------------------------------------------------------
-# Snapshot handling
-# -----------------------------------------------------------------------------
-
-
-def snapshot_record(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": row.get("id"),
-        "source": row.get("source"),
-        "name": row.get("name"),
-        "entity_type": row.get("entity_type"),
-        "enabled": row.get("enabled"),
-        "classification": row.get("classification"),
-        "scope_ids": row.get("snapshot_scope_ids", []),
-        "settings_hash": row.get("snapshot_settings_hash"),
-        "raw_hash": row.get("raw_hash"),
-    }
-
-
-def write_and_compare_snapshot(
-    rows: list[dict[str, Any]],
-    output_path: Path,
-) -> tuple[Path | None, list[dict[str, Any]]]:
-    if args.no_snapshot:
-        return None, []
-
-    snapshot_dir = Path(args.snapshot_dir).expanduser() if args.snapshot_dir else output_path.parent / "snapshots"
+def save_snapshot(
+    snapshot_dir: Path,
+    metadata: dict[str, Any],
+    policy_rows: list[dict[str, Any]],
+) -> tuple[Path, list[dict[str, Any]]]:
     snapshot_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = now_utc().strftime("%Y%m%d_%H%M%S")
-    snapshot_path = snapshot_dir / f"policy_snapshot_{timestamp}.json"
-
-    current_records = [snapshot_record(row) for row in rows if row.get("id")]
-    current_by_key = {f"{r['source']}|{r['id']}": r for r in current_records}
+    current = {
+        "metadata": metadata,
+        "policies": {r.get("id") or f"row-{i}": r for i, r in enumerate(policy_rows)},
+    }
 
     previous_files = sorted(snapshot_dir.glob("policy_snapshot_*.json"))
     previous_file = previous_files[-1] if previous_files else None
     changes: list[dict[str, Any]] = []
-
-    if previous_file and previous_file != snapshot_path:
+    if previous_file:
         try:
-            previous_records = json.loads(previous_file.read_text(encoding="utf-8"))
-            previous_by_key = {f"{r.get('source')}|{r.get('id')}": r for r in previous_records}
+            previous = json.loads(previous_file.read_text(encoding="utf-8"))
+            prev_policies = previous.get("policies", {})
+            curr_policies = current.get("policies", {})
+            prev_ids = set(prev_policies)
+            curr_ids = set(curr_policies)
+            for pid in sorted(curr_ids - prev_ids):
+                changes.append({"change": "ADDED", "id": pid, "name": curr_policies[pid].get("name", ""), "details": "New policy row in current snapshot"})
+            for pid in sorted(prev_ids - curr_ids):
+                changes.append({"change": "REMOVED", "id": pid, "name": prev_policies[pid].get("name", ""), "details": "Policy row no longer present"})
+            watch_fields = ["classification", "enabled", "scope_count", "reasons", "settings_diff_count", "action_mode_count"]
+            for pid in sorted(curr_ids & prev_ids):
+                diffs = []
+                for f in watch_fields:
+                    if str(prev_policies[pid].get(f)) != str(curr_policies[pid].get(f)):
+                        diffs.append(f"{f}: {prev_policies[pid].get(f)} -> {curr_policies[pid].get(f)}")
+                if diffs:
+                    changes.append({"change": "CHANGED", "id": pid, "name": curr_policies[pid].get("name", ""), "details": "; ".join(diffs)})
+        except Exception as e:
+            changes.append({"change": "SNAPSHOT_ERROR", "id": "", "name": str(previous_file), "details": str(e)})
 
-            for key, current in current_by_key.items():
-                previous = previous_by_key.get(key)
-                if not previous:
-                    changes.append(
-                        {
-                            "change_type": "ADDED",
-                            "source": current.get("source"),
-                            "id": current.get("id"),
-                            "name": current.get("name"),
-                            "field": "",
-                            "old": "",
-                            "new": "",
-                        }
-                    )
-                    continue
-                for field in ("name", "entity_type", "enabled", "classification", "scope_ids", "settings_hash", "raw_hash"):
-                    if previous.get(field) != current.get(field):
-                        changes.append(
-                            {
-                                "change_type": "CHANGED",
-                                "source": current.get("source"),
-                                "id": current.get("id"),
-                                "name": current.get("name"),
-                                "field": field,
-                                "old": json.dumps(previous.get(field), ensure_ascii=False, default=str),
-                                "new": json.dumps(current.get(field), ensure_ascii=False, default=str),
-                            }
-                        )
-
-            for key, previous in previous_by_key.items():
-                if key not in current_by_key:
-                    changes.append(
-                        {
-                            "change_type": "REMOVED",
-                            "source": previous.get("source"),
-                            "id": previous.get("id"),
-                            "name": previous.get("name"),
-                            "field": "",
-                            "old": "",
-                            "new": "",
-                        }
-                    )
-        except Exception as exc:  # noqa: BLE001
-            changes.append(
-                {
-                    "change_type": "SNAPSHOT_COMPARE_ERROR",
-                    "source": "",
-                    "id": "",
-                    "name": "",
-                    "field": "",
-                    "old": str(previous_file),
-                    "new": str(exc),
-                }
-            )
-
-    snapshot_path.write_text(json.dumps(current_records, indent=2, ensure_ascii=False), encoding="utf-8")
-    return snapshot_path, changes
+    out = snapshot_dir / f"policy_snapshot_{now_stamp()}.json"
+    out.write_text(json.dumps(current, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    return out, changes
 
 
-# -----------------------------------------------------------------------------
-# Excel generation
-# -----------------------------------------------------------------------------
-
-
-def style_header(ws, fill_color: str = "1F4E79") -> None:
-    fill = PatternFill("solid", fgColor=fill_color)
-    font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-    for cell in ws[1]:
-        cell.fill = fill
-        cell.font = font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.freeze_panes = "A2"
-
-
-def set_widths(ws, widths: list[int]) -> None:
-    for index, width in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(index)].width = width
-
-
-def append_table(ws, headers: list[str], rows: list[dict[str, Any]], widths: list[int] | None = None) -> None:
+def append_rows(ws, rows: list[dict[str, Any]], headers: list[str]) -> None:
     ws.append(headers)
-    style_header(ws)
+    for c in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=c)
+        cell.fill = PatternFill("solid", fgColor="1F4E79")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     for row in rows:
-        ws.append([row.get(header, "") for header in headers])
-        for cell in ws[ws.max_row]:
+        ws.append([row.get(h, "") for h in headers])
+        classification = row.get("classification")
+        fill_color = CLASS_COLORS.get(str(classification), "FFFFFF")
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=ws.max_row, column=c)
+            cell.fill = PatternFill("solid", fgColor=fill_color)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-            cell.font = Font(name="Arial", size=9)
-    if widths:
-        set_widths(ws, widths)
-
-
-def make_summary_rows(
-    vmware_targets: list[dict[str, Any]],
-    disconnected_targets: list[dict[str, Any]],
-    entity_counts: dict[str, int | str],
-    settings_policies: list[dict[str, Any]],
-    default_policies: list[dict[str, Any]],
-    placement_policies: list[dict[str, Any]],
-    results: list[dict[str, Any]],
-    audit_available: bool,
-    audit_count: int,
-    audit_note: str,
-    settings_status: str,
-    defaults_status: str,
-    placement_status: str,
-    snapshot_path: Path | None,
-    snapshot_changes: list[dict[str, Any]],
-) -> list[list[Any]]:
-    numeric_entity_total = sum(v for v in entity_counts.values() if isinstance(v, int))
-    rows: list[list[Any]] = [
-        ["Turbonomic Stale Policy Audit - VMware On-Premises"],
-        [],
-        ["Host", TURBO_HOST],
-        ["Analysis Date", now_utc().strftime("%Y-%m-%d %H:%M UTC")],
-        ["Inactivity Threshold", f"{INACTIVITY_DAYS} days"],
-        ["Audit Available", audit_available],
-        ["Audit Entries", audit_count],
-        ["Audit Note", audit_note],
-        [],
-        ["API Collection"],
-        ["Settings Policies Status", settings_status],
-        ["Default Policies Status", defaults_status],
-        ["Placement Policies Status", placement_status],
-        [],
-        ["VMware Environment"],
-        ["Total vCenter Targets", len(vmware_targets)],
-        ["Targets not in accepted state", len(disconnected_targets)],
-        ["Total VMware Entities", numeric_entity_total],
-    ]
-    for etype, count in entity_counts.items():
-        rows.append([f"  {etype}", count])
-
-    rows.extend(
-        [
-            [],
-            ["Policy Inventory"],
-            ["Settings Policies", len(settings_policies)],
-            ["Default Settings Policies", len(default_policies)],
-            ["Placement / Policy Endpoint", len(placement_policies)],
-            [],
-            ["Classification", "Count"],
-        ]
-    )
-    for classification in CLASSIFICATION_ORDER:
-        rows.append([classification, sum(1 for r in results if r.get("classification") == classification)])
-    rows.extend(
-        [
-            ["TOTAL", len(results)],
-            [],
-            ["VMware-specific", sum(1 for r in results if r.get("vmware_specific"))],
-            ["Other entity types", sum(1 for r in results if not r.get("vmware_specific"))],
-            [],
-            ["Snapshot File", str(snapshot_path) if snapshot_path else "N/A"],
-            ["Snapshot Changes", len(snapshot_changes)],
-        ]
-    )
-    return rows
+    ws.freeze_panes = "A2"
+    for i, h in enumerate(headers, 1):
+        width = min(max(len(h) + 2, 12), 60)
+        if h in {"justification", "reasons", "details", "text"}:
+            width = 70
+        if h in {"id", "policy_id", "scope_uuid"}:
+            width = 38
+        ws.column_dimensions[get_column_letter(i)].width = width
 
 
 def generate_excel_report(
     output_path: Path,
-    results: list[dict[str, Any]],
-    vmware_targets: list[dict[str, Any]],
-    disconnected_targets: list[dict[str, Any]],
-    entity_counts: dict[str, int | str],
-    settings_policies: list[dict[str, Any]],
-    default_policies: list[dict[str, Any]],
-    placement_policies: list[dict[str, Any]],
-    placement_rows: list[dict[str, Any]],
+    metadata: dict[str, Any],
+    policy_rows: list[dict[str, Any]],
     action_mode_rows: list[dict[str, Any]],
     scope_rows: list[dict[str, Any]],
     conflict_rows: list[dict[str, Any]],
+    audit_match_rows: list[dict[str, Any]],
     snapshot_changes: list[dict[str, Any]],
-    snapshot_path: Path | None,
-    audit_available: bool,
-    audit_count: int,
-    audit_note: str,
-    settings_status: str,
-    defaults_status: str,
-    placement_status: str,
+    vmware_targets: list[dict[str, Any]],
+    not_accepted_targets: list[dict[str, Any]],
+    entity_counts: dict[str, int],
 ) -> Path:
     wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
 
-    ws_summary = wb.active
-    ws_summary.title = "Summary"
-    for row in make_summary_rows(
-        vmware_targets,
-        disconnected_targets,
-        entity_counts,
-        settings_policies,
-        default_policies,
-        placement_policies,
-        results,
-        audit_available,
-        audit_count,
-        audit_note,
-        settings_status,
-        defaults_status,
-        placement_status,
-        snapshot_path,
-        snapshot_changes,
-    ):
-        ws_summary.append(row)
-    ws_summary["A1"].font = Font(bold=True, size=14, name="Arial", color="1F4E79")
-    ws_summary.column_dimensions["A"].width = 38
-    ws_summary.column_dimensions["B"].width = 80
+    summary_rows = [
+        ["Turbonomic Stale Policy Audit - VMware On-Premises"],
+        [],
+        ["Host", metadata.get("host")],
+        ["Analysis Date", metadata.get("analysis_date")],
+        ["Inactivity Threshold", f"{metadata.get('days')} days"],
+        ["Audit Requested", metadata.get("audit_requested")],
+        ["Audit Available", metadata.get("audit_available")],
+        ["Audit Message", metadata.get("audit_message")],
+        ["Audit Artifact", metadata.get("audit_artifact")],
+        ["Snapshot", metadata.get("snapshot_path")],
+        [],
+        ["VMware Environment"],
+        ["VMware Targets", len(vmware_targets)],
+        ["Targets Not Accepted", len(not_accepted_targets)],
+        ["Total VMware Entities", sum(entity_counts.values())],
+    ]
+    for etype, count in entity_counts.items():
+        summary_rows.append([f"  {etype}", count])
+    summary_rows.extend([
+        [],
+        ["Policy Audit Results"],
+        ["TOTAL rows", len(policy_rows)],
+        ["VMware-specific", sum(1 for r in policy_rows if r.get("vmware_specific") == "True")],
+        ["Other types", sum(1 for r in policy_rows if r.get("vmware_specific") != "True")],
+    ])
+    for cls in CLASS_ORDER:
+        summary_rows.append([cls, sum(1 for r in policy_rows if r.get("classification") == cls)])
+    summary_rows.extend([
+        [],
+        ["Additional Analysis"],
+        ["Action mode rows", len(action_mode_rows)],
+        ["Scope analysis rows", len(scope_rows)],
+        ["Conflict rows", len(conflict_rows)],
+        ["Audit log match rows", len(audit_match_rows)],
+        ["Snapshot change rows", len(snapshot_changes)],
+    ])
+    for row in summary_rows:
+        ws.append(row)
+    ws["A1"].font = Font(bold=True, size=14, color="1F4E79")
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 100
 
     policy_headers = [
-        "classification",
-        "justification",
-        "source",
-        "name",
-        "entity_type",
-        "vmware_specific",
-        "enabled",
-        "is_default",
-        "scope_count",
-        "scope_health",
-        "resolved_scopes",
-        "unresolved_scopes",
-        "empty_scope_groups",
-        "default_compare_status",
-        "changed_settings",
-        "total_settings",
-        "action_modes",
-        "conflict_count",
-        "audit_check",
-        "actions_check",
-        "actions_note",
-        "last_modified",
-        "age_days",
-        "reasons",
-        "id",
+        "classification", "source", "vmware_specific", "name", "entityType", "enabled",
+        "default_policy", "scope_count", "unresolved_scopes", "empty_groups",
+        "settings_diff_count", "settings_compared", "action_mode_count", "audit_matches",
+        "action_check", "reasons", "justification", "last_modified", "id",
     ]
-    policy_widths = [18, 50, 18, 50, 22, 14, 10, 10, 12, 16, 14, 16, 16, 22, 16, 14, 30, 14, 14, 18, 20, 24, 10, 70, 38]
-
-    # Individual classification sheets.
-    for classification in CLASSIFICATION_ORDER:
-        rows = [r for r in results if r.get("classification") == classification]
-        ws = wb.create_sheet(sanitize_sheet_name(classification))
-        append_table(ws, policy_headers, rows, policy_widths)
-        fill = PatternFill("solid", fgColor=CLASSIFICATION_COLORS.get(classification, "FFFFFF"))
-        for row_idx in range(2, ws.max_row + 1):
-            for col_idx in range(1, len(policy_headers) + 1):
-                ws.cell(row=row_idx, column=col_idx).fill = fill
+    for cls in CLASS_ORDER:
+        ws_cls = wb.create_sheet(cls[:31])
+        append_rows(ws_cls, [r for r in policy_rows if r.get("classification") == cls], policy_headers)
 
     ws_all = wb.create_sheet("All Policies")
-    all_rows = sorted(
-        results,
-        key=lambda r: (CLASSIFICATION_ORDER.index(r.get("classification", "UNKNOWN")) if r.get("classification") in CLASSIFICATION_ORDER else 99, r.get("name", "")),
-    )
-    append_table(ws_all, policy_headers, all_rows, policy_widths)
+    sorted_rows = sorted(policy_rows, key=lambda r: (CLASS_ORDER.index(r.get("classification", "UNKNOWN")) if r.get("classification") in CLASS_ORDER else 99, r.get("source", ""), r.get("name", "")))
+    append_rows(ws_all, sorted_rows, policy_headers)
 
-    ws_actions = wb.create_sheet("Action Modes")
-    append_table(
-        ws_actions,
-        ["policy_id", "policy_name", "entity_type", "manager", "setting_uuid", "setting_name", "value", "risk"],
-        action_mode_rows,
-        [38, 50, 22, 30, 38, 45, 20, 12],
-    )
+    ws_modes = wb.create_sheet("Action Modes")
+    append_rows(ws_modes, action_mode_rows, ["policy_name", "entityType", "setting_name", "setting_key", "value", "default_value", "risk", "path", "policy_id"])
 
-    ws_scopes = wb.create_sheet("Scopes")
-    append_table(
-        ws_scopes,
-        ["policy_id", "policy_name", "entity_type", "scope_uuid", "scope_name", "resolved", "member_count", "group_type", "class_name", "health", "error"],
-        scope_rows,
-        [38, 50, 22, 38, 45, 10, 14, 22, 22, 16, 60],
-    )
+    ws_scope = wb.create_sheet("Scope Analysis")
+    append_rows(ws_scope, scope_rows, ["policy_name", "source", "entityType", "scope_name", "scope_uuid", "exists", "member_count", "groupType", "status", "policy_id"])
 
-    ws_placement = wb.create_sheet("Placement Policies")
-    append_table(
-        ws_placement,
-        [
-            "classification",
-            "justification",
-            "source",
-            "name",
-            "entity_type",
-            "enabled",
-            "policy_type",
-            "consumer_group",
-            "provider_group",
-            "merge_groups",
-            "unresolved_groups",
-            "empty_groups",
-            "group_details",
-            "reasons",
-            "id",
-        ],
-        placement_rows,
-        [18, 50, 18, 50, 22, 10, 22, 35, 35, 14, 16, 14, 70, 60, 38],
-    )
+    ws_conflicts = wb.create_sheet("Policy Conflicts")
+    append_rows(ws_conflicts, conflict_rows, ["policy_name", "entityType", "scope_key", "setting_name", "setting_key", "value", "conflict_count", "distinct_values", "policy_id"])
 
-    ws_conflicts = wb.create_sheet("Conflicts")
-    append_table(
-        ws_conflicts,
-        ["entity_type", "scope_ids", "setting_key", "setting_name", "policy_id", "policy_name", "value"],
-        conflict_rows,
-        [22, 60, 45, 45, 38, 50, 40],
-    )
+    ws_audit = wb.create_sheet("Audit Log Matches")
+    append_rows(ws_audit, audit_match_rows, ["policy_name", "source", "match_type", "file", "line", "text", "policy_id"])
 
-    ws_snapshot = wb.create_sheet("Snapshot Changes")
-    append_table(
-        ws_snapshot,
-        ["change_type", "source", "id", "name", "field", "old", "new"],
-        snapshot_changes,
-        [22, 18, 38, 50, 24, 70, 70],
-    )
+    ws_changes = wb.create_sheet("Snapshot Changes")
+    append_rows(ws_changes, snapshot_changes, ["change", "name", "details", "id"])
 
     ws_vmware = wb.create_sheet("VMware Environment")
     ws_vmware.append(["VMware vCenter Targets"])
-    ws_vmware.append(["Target Name", "Category", "Type", "Status", "Accepted Status", "UUID"])
-    style_header(ws_vmware)
+    ws_vmware.append(["Target Name", "Type", "Category", "Status", "UUID"])
     for target in vmware_targets:
-        status = target.get("status", "UNKNOWN")
-        ws_vmware.append(
-            [
-                target.get("displayName") or target.get("name") or "N/A",
-                target.get("category", ""),
-                target.get("type", ""),
-                status,
-                is_target_ok(status),
-                target.get("uuid", "N/A"),
-            ]
-        )
-        if not is_target_ok(status):
-            for cell in ws_vmware[ws_vmware.max_row]:
-                cell.fill = PatternFill("solid", fgColor="FFCCCC")
-    set_widths(ws_vmware, [45, 20, 20, 20, 18, 38])
+        ws_vmware.append([
+            target.get("displayName") or get_target_field(target, "address") or "N/A",
+            target.get("type", ""),
+            target.get("category", ""),
+            target.get("status", ""),
+            target.get("uuid", ""),
+        ])
+    ws_vmware.append([])
+    ws_vmware.append(["Entity Type", "Count"])
+    for etype, count in entity_counts.items():
+        ws_vmware.append([etype, count])
+    for col in range(1, 6):
+        ws_vmware.column_dimensions[get_column_letter(col)].width = 32
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
     return output_path
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+def copy_to_parent_if_possible(output_path: Path) -> Path | None:
+    try:
+        parent_dest = output_path.parent.parent / output_path.name
+        if parent_dest != output_path:
+            shutil.copy2(output_path, parent_dest)
+            return parent_dest
+    except Exception:
+        return None
+    return None
 
 
-def main() -> Path:
-    print("=" * 70)
+def main() -> None:
+    args = parse_args()
+    host = normalize_url(args.host)
+    output_path = resolve_output_path(args.output)
+    output_dir = output_path.parent
+    audit_days = args.admin_audit_days if args.admin_audit_days is not None else args.days
+    audit_artifact_dir = Path(args.audit_artifact_dir).expanduser() if args.audit_artifact_dir else output_dir / "auditlogs"
+    snapshot_dir = Path(args.snapshot_dir).expanduser() if args.snapshot_dir else output_dir / "snapshots"
+
+    print("=" * 84)
     print("  Turbonomic Stale Policy Audit - VMware On-Premises Focus")
-    print("=" * 70)
+    print("=" * 84)
 
-    output_path = resolve_output_path(OUTPUT_FILE)
-    session = login()
+    session = create_session(args)
+    login_info = login(session, host, args)
 
-    vmware_targets, disconnected_targets = analyze_vmware_targets(session)
-    entity_counts = get_vmware_entity_counts(session)
+    vmware_targets, not_accepted_targets = analyze_vmware_targets(session, host)
+    entity_counts = get_vmware_entity_counts(session, host, args)
 
-    cutoff_date = now_utc() - timedelta(days=INACTIVITY_DAYS)
-    cutoff_ms = int(cutoff_date.timestamp() * 1000)
+    settings_policies, settings_status, _ = fetch_settings_policies(session, host, args)
+    default_policies, default_status, _ = fetch_default_settings_policies(session, host)
+    placement_policies, placement_status, _ = fetch_policy_endpoint(session, host)
 
-    audit_available, policy_ids_in_audit, audit_count, audit_note = collect_audit_log(session, cutoff_ms)
+    default_ids = {get_policy_id(p) for p in default_policies if get_policy_id(p)}
+    default_index = build_default_setting_index(default_policies)
 
-    settings_policies, settings_status = collect_settings_policies(session)
-    default_policies, defaults_status = collect_default_settings_policies(session)
-    placement_policies, placement_status = collect_placement_policies(session)
+    all_raw_policies = settings_policies + placement_policies
 
-    _, default_settings_by_entity, default_ids = build_default_policy_maps(default_policies)
+    audit_result = {
+        "requested": bool(args.use_admin_auditlogs),
+        "available": False,
+        "status_code": None,
+        "message": "not requested",
+        "path": "",
+        "sha256": "",
+        "files": [],
+    }
+    if args.use_admin_auditlogs:
+        audit_result = fetch_admin_auditlogs(session, host, audit_days, audit_artifact_dir)
+
+    audit_matches = build_audit_matches(all_raw_policies, audit_result, args.max_audit_matches_per_policy)
 
     group_cache: dict[str, dict[str, Any]] = {}
+    action_cache: dict[str, dict[str, Any]] = {}
+    policy_rows: list[dict[str, Any]] = []
+    action_mode_rows: list[dict[str, Any]] = []
+    scope_rows: list[dict[str, Any]] = []
+    audit_match_rows: list[dict[str, Any]] = []
 
-    settings_results, action_mode_rows, scope_rows, conflict_rows = analyze_settings_policies(
-        session=session,
-        policies=settings_policies,
-        default_settings_by_entity=default_settings_by_entity,
-        default_ids=default_ids,
-        audit_available=audit_available,
-        policy_ids_in_audit=policy_ids_in_audit,
-        cutoff_ms=cutoff_ms,
-        group_cache=group_cache,
-    )
-
-    placement_rows = [analyze_placement_policy(session, p, group_cache) for p in placement_policies]
-
-    # Include placement policy rows in the global view, but keep source-specific
-    # details in the Placement Policies sheet.
-    placement_as_global = []
-    for row in placement_rows:
-        placement_as_global.append(
-            {
-                "classification": row.get("classification"),
-                "justification": row.get("justification"),
-                "source": row.get("source"),
-                "id": row.get("id"),
-                "name": row.get("name"),
-                "entity_type": row.get("entity_type"),
-                "vmware_specific": row.get("entity_type") in VMWARE_ENTITY_TYPES,
-                "enabled": row.get("enabled"),
-                "is_default": False,
-                "scope_count": "N/A",
-                "scope_health": "N/A",
-                "resolved_scopes": "N/A",
-                "unresolved_scopes": row.get("unresolved_groups"),
-                "empty_scope_groups": row.get("empty_groups"),
-                "default_compare_status": "N/A",
-                "changed_settings": "N/A",
-                "total_settings": "N/A",
-                "action_modes": "N/A",
-                "conflict_count": "N/A",
-                "audit_check": "N/A",
-                "actions_check": "N/A",
-                "actions_note": "N/A",
-                "last_modified": "N/A",
-                "age_days": "N/A",
-                "reasons": row.get("reasons"),
-                "raw_hash": row.get("raw_hash"),
-                "snapshot_scope_ids": [],
-                "snapshot_settings_hash": row.get("raw_hash"),
-            }
+    # Settings / automation policies
+    for p in settings_policies:
+        pid = get_policy_id(p)
+        scopes = get_scopes(p)
+        policy_scope_rows, _scope_checked, unresolved, empty_groups = analyze_scopes(
+            session,
+            host,
+            p,
+            "settings_policy",
+            args.skip_group_check,
+            group_cache,
+        )
+        scope_rows.extend(policy_scope_rows)
+        setting_diff_count, setting_compare_count = count_setting_differences(p, default_index)
+        modes = extract_action_modes(p, default_index)
+        action_mode_rows.extend(modes)
+        actions_info = None
+        if not args.skip_action_check:
+            actions_info = check_recent_actions(session, host, pid, args.days, action_cache)
+        audit_count = len(audit_matches.get(pid, []))
+        classification, justification, reasons = classify_settings_policy(
+            p,
+            default_ids,
+            len(scopes),
+            unresolved,
+            empty_groups,
+            setting_diff_count,
+            setting_compare_count,
+            modes,
+            audit_count,
+            actions_info,
+        )
+        policy_rows.append(
+            make_policy_row(
+                p,
+                "settings_policy",
+                classification,
+                justification,
+                reasons,
+                default_ids,
+                setting_diff_count=setting_diff_count,
+                setting_compare_count=setting_compare_count,
+                action_mode_count=len(modes),
+                scope_count=len(scopes),
+                unresolved_scopes=unresolved,
+                empty_groups=empty_groups,
+                audit_match_count=audit_count,
+                actions_info=actions_info,
+            )
         )
 
-    results = settings_results + placement_as_global
+    # Placement / policy endpoint rows are inventory-oriented and intentionally analyzed separately.
+    for p in placement_policies:
+        pid = get_policy_id(p)
+        audit_count = len(audit_matches.get(pid, []))
+        classification, justification, reasons = classify_placement_policy(p, audit_count)
+        policy_rows.append(
+            make_policy_row(
+                p,
+                "placement_policy_endpoint",
+                classification,
+                justification,
+                reasons,
+                default_ids,
+                audit_match_count=audit_count,
+                actions_info=None,
+            )
+        )
 
-    snapshot_path, snapshot_changes = write_and_compare_snapshot(results, output_path)
+    # Audit matches worksheet rows
+    id_to_name_source = {r["id"]: (r["name"], r["source"]) for r in policy_rows if r.get("id")}
+    for pid, matches in audit_matches.items():
+        name, source = id_to_name_source.get(pid, ("", ""))
+        for m in matches:
+            audit_match_rows.append(
+                {
+                    "policy_id": pid,
+                    "policy_name": name,
+                    "source": source,
+                    "match_type": m.get("match_type", ""),
+                    "file": m.get("file", ""),
+                    "line": m.get("line", ""),
+                    "text": m.get("text", ""),
+                }
+            )
 
-    to_candidate_delete = [r for r in results if r.get("classification") == "CANDIDATE_DELETE"]
-    to_review = [r for r in results if r.get("classification") == "REVIEW"]
-    to_keep = [r for r in results if r.get("classification") == "KEEP"]
-    info_rows = [r for r in results if r.get("classification") == "INFO"]
-    unknown_rows = [r for r in results if r.get("classification") == "UNKNOWN"]
-    vmware_flagged = [r for r in results if r.get("vmware_specific")]
-    non_vmware_flagged = [r for r in results if not r.get("vmware_specific")]
+    conflict_rows = analyze_conflicts(settings_policies)
 
-    print(f"\n{'=' * 70}")
+    metadata = {
+        "host": host,
+        "analysis_date": now_utc().strftime("%Y-%m-%d %H:%M UTC"),
+        "days": args.days,
+        "user": login_info.get("username", args.user),
+        "roles": ",".join([r.get("name", "") for r in login_info.get("roles", [])]) if isinstance(login_info.get("roles"), list) else "",
+        "settings_status": settings_status,
+        "default_settings_status": default_status,
+        "placement_status": placement_status,
+        "audit_requested": str(audit_result.get("requested")),
+        "audit_available": str(audit_result.get("available")),
+        "audit_status_code": audit_result.get("status_code"),
+        "audit_message": audit_result.get("message"),
+        "audit_artifact": audit_result.get("path"),
+        "snapshot_path": "",
+    }
+
+    snapshot_changes: list[dict[str, Any]] = []
+    if not args.no_snapshot:
+        snapshot_path, snapshot_changes = save_snapshot(snapshot_dir, metadata, policy_rows)
+        metadata["snapshot_path"] = str(snapshot_path)
+        print(f"\nSnapshot saved: {snapshot_path}")
+
+    print("\n" + "=" * 84)
     print("  AUDIT SUMMARY")
-    print(f"{'=' * 70}")
-    print(f"  Host: {TURBO_HOST}")
-    print(f"  Inactivity threshold: {INACTIVITY_DAYS} days")
-    print(f"  Analysis date: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"  Audit available: {audit_available} ({audit_note})")
-    print(f"{'=' * 70}")
-    print(f"  VMware targets    : {len(vmware_targets)} ({len(disconnected_targets)} not accepted)")
-    print(f"  VMware entities   : {sum(v for v in entity_counts.values() if isinstance(v, int))}")
-    print(f"{'=' * 70}")
-    print(f"  TOTAL rows        : {len(results)}")
-    print(f"    VMware-specific : {len(vmware_flagged)}")
-    print(f"    Other types     : {len(non_vmware_flagged)}")
-    print(f"{'=' * 70}")
-    print(f"  CANDIDATE_DELETE  : {len(to_candidate_delete)}")
-    print(f"  REVIEW            : {len(to_review)}")
-    print(f"  KEEP              : {len(to_keep)}")
-    print(f"  INFO              : {len(info_rows)}")
-    print(f"  UNKNOWN           : {len(unknown_rows)}")
-    print(f"{'=' * 70}\n")
+    print("=" * 84)
+    print(f"  Host: {host}")
+    print(f"  Inactivity threshold: {args.days} days")
+    print(f"  Analysis date: {metadata['analysis_date']}")
+    print(f"  User/roles: {metadata.get('user')} / {metadata.get('roles')}")
+    if args.use_admin_auditlogs:
+        print(f"  Admin auditlogs: {metadata['audit_available']} ({metadata['audit_message']})")
+    else:
+        print("  Admin auditlogs: not requested")
+    print("=" * 84)
+    print(f"  VMware targets    : {len(vmware_targets)} ({len(not_accepted_targets)} not accepted)")
+    print(f"  VMware entities   : {sum(entity_counts.values())}")
+    print("=" * 84)
+    print(f"  TOTAL rows        : {len(policy_rows)}")
+    print(f"    VMware-specific : {sum(1 for r in policy_rows if r.get('vmware_specific') == 'True')}")
+    print(f"    Other types     : {sum(1 for r in policy_rows if r.get('vmware_specific') != 'True')}")
+    print("=" * 84)
+    for cls in CLASS_ORDER:
+        print(f"  {cls:<16}: {sum(1 for r in policy_rows if r.get('classification') == cls)}")
+    print("=" * 84)
+    print(f"  Action mode rows  : {len(action_mode_rows)}")
+    print(f"  Scope rows        : {len(scope_rows)}")
+    print(f"  Conflict rows     : {len(conflict_rows)}")
+    print(f"  Audit matches     : {len(audit_match_rows)}")
+    print(f"  Snapshot changes  : {len(snapshot_changes)}")
+    print("=" * 84)
 
-    generate_excel_report(
-        output_path=output_path,
-        results=results,
-        vmware_targets=vmware_targets,
-        disconnected_targets=disconnected_targets,
-        entity_counts=entity_counts,
-        settings_policies=settings_policies,
-        default_policies=default_policies,
-        placement_policies=placement_policies,
-        placement_rows=placement_rows,
-        action_mode_rows=action_mode_rows,
-        scope_rows=scope_rows,
-        conflict_rows=conflict_rows,
-        snapshot_changes=snapshot_changes,
-        snapshot_path=snapshot_path,
-        audit_available=audit_available,
-        audit_count=audit_count,
-        audit_note=audit_note,
-        settings_status=settings_status,
-        defaults_status=defaults_status,
-        placement_status=placement_status,
+    final_path = generate_excel_report(
+        output_path,
+        metadata,
+        policy_rows,
+        action_mode_rows,
+        scope_rows,
+        conflict_rows,
+        audit_match_rows,
+        snapshot_changes,
+        vmware_targets,
+        not_accepted_targets,
+        entity_counts,
     )
-
-    print(f"Report exported: {output_path.resolve()}")
-    if snapshot_path:
-        print(f"Snapshot saved:  {snapshot_path.resolve()}")
+    print(f"\nReport exported: {final_path}")
+    copied = copy_to_parent_if_possible(final_path)
+    if copied:
+        print(f"Copied to: {copied}")
     print(
-        "Sheets: 'Summary' | 'CANDIDATE_DELETE' | 'REVIEW' | 'KEEP' | 'INFO' | "
-        "'UNKNOWN' | 'All Policies' | 'Action Modes' | 'Scopes' | "
-        "'Placement Policies' | 'Conflicts' | 'Snapshot Changes' | 'VMware Environment'"
+        "Sheets: 'Summary' | 'CANDIDATE_DELETE' | 'REVIEW' | 'KEEP' | 'INFO' | 'UNKNOWN' | "
+        "'All Policies' | 'Action Modes' | 'Scope Analysis' | 'Policy Conflicts' | "
+        "'Audit Log Matches' | 'Snapshot Changes' | 'VMware Environment'"
     )
-    return output_path
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("Interrupted by user")
-        sys.exit(130)
+    main()
